@@ -23,6 +23,7 @@ export interface JobApi {
   lastError: string | null;
   idempotencyKey: string;
   createdAt: string;
+  runAt: string;
   startedAt: string | null;
   finishedAt: string | null;
 }
@@ -44,6 +45,7 @@ export function toApiJob(row: JobRow): JobApi {
     lastError: row.last_error,
     idempotencyKey: row.idempotency_key,
     createdAt: toIso(row.created_at),
+    runAt: toIso(row.run_at),
     startedAt: row.started_at ? toIso(row.started_at) : null,
     finishedAt: row.finished_at ? toIso(row.finished_at) : null,
   };

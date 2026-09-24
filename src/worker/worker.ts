@@ -3,7 +3,12 @@ import { closePool } from '../config/database';
 import { JobRow } from '../jobs/job.model';
 
 import { getHandler } from './job.handlers';
-import { claimJobs, completeJobSucceeded, failJob } from './jobs.worker.repository';
+import {
+  claimJobs,
+  completeJobSucceeded,
+  recordJobFailure,
+} from './jobs.worker.repository';
+import { computeRetryDelay } from './retry';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -80,28 +85,55 @@ class WorkerProcess {
   }
 
   private async process(job: JobRow): Promise<void> {
+    const attempt = job.attempts;
     try {
       const handler = getHandler(job.type);
       if (!handler) {
         throw new Error(`no handler registered for job type "${job.type}"`);
       }
-      const result = await handler(job.payload);
+      const result = await handler(job.payload, { attempt });
       await completeJobSucceeded(job.id, result);
       console.log(
-        `[${this.id}] finished job ${job.id} status=succeeded ` +
+        `[${this.id}] finished job ${job.id} attempt=${attempt} status=succeeded ` +
           `active=${this.active.size - 1}/${this.concurrency}`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const schedule = computeRetryDelay(attempt, config.jobBaseDelayMs);
+      let outcome: Awaited<ReturnType<typeof recordJobFailure>>;
       try {
-        await failJob(job.id, message);
+        outcome = await recordJobFailure(
+          job.id,
+          message,
+          attempt,
+          job.max_attempts,
+          schedule.delayMs
+        );
       } catch (markError) {
-        console.error(`[${this.id}] failed to mark job ${job.id} as failed:`, markError);
+        console.error(`[${this.id}] failed to record outcome for job ${job.id}:`, markError);
+        return;
       }
-      console.log(
-        `[${this.id}] finished job ${job.id} status=failed ` +
-          `active=${this.active.size - 1}/${this.concurrency} error="${message}"`
-      );
+      if (outcome === 'retry') {
+        console.log(`[${this.id}] job ${job.id} attempt=${attempt} failed`);
+        console.log(
+          `[${this.id}] retry scheduled delayMs=${schedule.delayMs} ` +
+            `exponentialMs=${schedule.exponentialDelayMs} jitterMs=${schedule.jitterMs} ` +
+            `runAt=${schedule.runAt.toISOString()}`
+        );
+        console.log(
+          `[${this.id}] finished job ${job.id} attempt=${attempt} status=pending ` +
+            `active=${this.active.size - 1}/${this.concurrency}`
+        );
+      } else if (outcome === 'dead') {
+        console.log(
+          `[${this.id}] job ${job.id} attempt=${attempt} dead ` +
+            `lastError="${message}"`
+        );
+      } else {
+        console.log(
+          `[${this.id}] job ${job.id} attempt=${attempt} failed but no longer owned; outcome not recorded`
+        );
+      }
     } finally {
       this.active.delete(job.id);
     }

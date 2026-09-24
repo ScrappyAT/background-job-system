@@ -12,10 +12,12 @@ export interface EnqueuedJob {
 export async function enqueueReviewJob(input: {
   review: string;
   idempotencyKey: string;
+  testFailureMode?: 'always' | 'once';
 }): Promise<EnqueuedJob> {
   const created = await insertJob({
     review: input.review,
     idempotencyKey: input.idempotencyKey,
+    testFailureMode: input.testFailureMode,
     maxAttempts: config.jobMaxAttempts,
   });
 

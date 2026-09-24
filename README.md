@@ -6,11 +6,12 @@ A client submits customer-review text to an API. The API records the work as a *
 and responds immediately; the AI analysis itself runs later, out of band, in a separate
 worker process.
 
-> **Phase 3 status:** a separate background **worker** process now claims and completes
-> jobs, using an atomic PostgreSQL claim. Jobs are enqueued by the API
-> (`POST /api/jobs`) and status read via `GET /api/jobs/:id`. Retry/backoff, stuck-job
-> recovery, dead-letter handling, and a real AI provider are **not** implemented yet.
-> See [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
+> **Phase 4 status:** handled failures now drive automatic **retries with exponential
+> backoff + jitter**, and jobs become **`dead`** when the retry budget is exhausted.
+> A controlled `testFailureMode` on `POST /api/jobs` makes the retry behaviour
+> demonstrable. Stuck-job recovery, dead-letter view/manual retry, and a real AI provider
+> are **not** implemented yet. See
+> [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
 
 ## Tech stack
 
@@ -70,9 +71,14 @@ Validation:
 
 - `review` — required, must be a non-empty string after trimming.
 - `idempotencyKey` — required, must be a non-empty string after trimming.
+- `testFailureMode` — **optional**, must be `"always"` or `"once"`. A controlled hook that
+  makes the simulated handler deliberately throw so retry behaviour can be demonstrated.
+  Omit it for normal behaviour. See
+  [Controlled test failure mode](#controlled-test-failure-mode).
 
-Both values are trimmed before being stored. Every submitted job is created with
-`type = "review_analysis"`; clients cannot choose an arbitrary job type.
+Both `review` and `idempotencyKey` are trimmed before being stored. Every submitted job is
+created with `type = "review_analysis"`; clients cannot choose an arbitrary job type. The
+testing field is stored inside the job's payload so that retries behave consistently.
 
 Success response — HTTP `202 Accepted` (the job was accepted for later processing):
 
@@ -88,6 +94,7 @@ Success response — HTTP `202 Accepted` (the job was accepted for later process
     "lastError": null,
     "idempotencyKey": "review-001",
     "createdAt": "2026-09-24T09:34:48.715Z",
+    "runAt": "2026-09-24T09:34:48.715Z",
     "startedAt": null,
     "finishedAt": null
   }
@@ -130,6 +137,7 @@ Example duplicate response (note the same `id`, and `"duplicate": true`):
     "lastError": null,
     "idempotencyKey": "review-001",
     "createdAt": "2026-09-24T09:34:48.715Z",
+    "runAt": "2026-09-24T09:34:48.715Z",
     "startedAt": null,
     "finishedAt": null
   }
@@ -138,7 +146,8 @@ Example duplicate response (note the same `id`, and `"duplicate": true`):
 
 ### `GET /api/jobs/:id` — get a job's status
 
-Returns the current state of a job by its UUID.
+Returns the current state of a job by its UUID, including `runAt` — the time it was or is
+next eligible to run (used to inspect a scheduled retry from the outside).
 
 ```powershell
 Invoke-RestMethod -Uri http://localhost:3000/api/jobs/3467d3f0-a325-44aa-874d-49209a433ea0
@@ -157,6 +166,7 @@ Success response — HTTP 200:
     "lastError": null,
     "idempotencyKey": "review-001",
     "createdAt": "2026-09-24T09:34:48.715Z",
+    "runAt": "2026-09-24T09:34:48.715Z",
     "startedAt": null,
     "finishedAt": null
   }
@@ -283,7 +293,8 @@ simulation that:
 ```
 
 `reviewFingerprint` is a deterministic hash of the review, so the same review always
-produces the same result. Unknown job types are marked `failed` with a recorded error.
+produces the same result. Unknown job types are treated like any other failure: the error
+is recorded and the job is retried (then eventually `dead`) via the normal retry path.
 
 ### Successful completion and durable results
 
@@ -306,25 +317,78 @@ durable output is idempotent at the database level.
 ### Attempts semantics
 
 `attempts` means **"how many times the job has been claimed/started by a worker"**. The
-claim statement increments `attempts` atomically when a job is picked up. It is **not**
-incremented again on success: a successful job's `attempts` reflects every execution that
-occurred, including the final successful one. If an execution fails, the attempt that just
-failed is already counted by the claim increment; retry scheduling (future phase) will use
-`attempts` vs `max_attempts` to decide whether to retry or mark the job `dead`.
+claim statement increments `attempts` atomically when a job is picked up, so by the time a
+handler runs, `attempts` is the number of the attempt currently executing (1 for the first
+claim). It is **not** incremented again on success or failure — a job that succeeds on its
+second attempt records `attempts = 2`, and a job that exhausts its budget records
+`attempts = max_attempts`. On failure the worker compares `attempts` against the job's
+`max_attempts` to decide whether to schedule a retry (returning to `pending` with a future
+`run_at`) or to move the job to `dead`.
 
-### Temporary failure behaviour (this phase)
+### Failure, retries, exponential backoff, and dead-lettering
 
-If the handler throws (handled exception), the worker marks the job `failed` and stores the
-message in `last_error` so it can be diagnosed. **No retry/backoff exists yet** — the job
-simply stays `failed`. A hard kill of a worker (e.g. closing the terminal abruptly) can
-leave an in-progress job in `processing`; that is **expected** for now and is exactly what
-the future stuck-job recovery phase will address.
+**Failure semantics.** When a handler throws, the worker records the failure safely and
+only if it still owns the job (`status = 'processing'`, so a stale worker can never
+overwrite a job it no longer owns). The decision uses `attempts` vs `max_attempts`, where
+`attempts` is the number of the attempt that just failed (it was incremented at claim
+time):
+
+- **retryable** (`attempts < max_attempts`) — the job is returned to **`pending`** with a
+  **future `run_at`**, `last_error` set to the failure message, and `started_at`/`finished_at`
+  cleared. The existing claim query (`status = 'pending' AND run_at <= now()`) picks it up
+  again later. A retryable job is **never** left resting in `failed` — `failed` conceptually
+  represents a single failed attempt, and the normal resting state between attempts is
+  `pending`.
+- **exhausted** (`attempts >= max_attempts`) — the job is set to **`dead`**, `last_error`
+  is recorded, and `finished_at = now()`. No further retry is scheduled and automatic
+  processing stops.
+
+**Exponential backoff.** Each retry waits `run_at = now + retryDelay`:
+
+```
+retryDelay = JOB_BASE_DELAY_MS * 2^(attempt - 1)  +  jitter
+```
+
+`attempt` is the number of the attempt that just failed. With `JOB_BASE_DELAY_MS = 1000`
+this produces ~1 s, ~2 s, ~4 s, ~8 s, … between attempts.
+
+**Jitter.** A random whole number in **`[0, JOB_BASE_DELAY_MS]`** is added to the
+exponential component. The purpose is to stop many failing jobs from all retrying at the
+same instant (avoiding "thundering herd" on the queue and downstream systems). Jitter is
+bounded by one base delay, so the exponential growth remains clearly visible despite the
+randomness; overflow is capped at `2^31 - 1` ms.
+
+**Retry lifecycle:**
+
+```
+pending
+  -> processing (attempt 1)
+  -> pending with future run_at (exponential + jitter delay)
+  -> processing (attempt 2)
+  -> pending with future run_at
+  -> ...
+  -> dead            (when attempts reaches max_attempts)
+```
+
+**Controlled test failure mode.** Because there is no real AI provider yet, the simulated
+`review_analysis` handler can be told to fail deliberately via an optional `testFailureMode`
+field on `POST /api/jobs` (only `"always"` and `"once"` are accepted; anything else is
+rejected with `422`):
+
+- `testFailureMode: "always"` — every attempt throws a predictable error, so the job is
+  guaranteed to burn through all attempts and end `dead`. This is what lets us prove the
+  100%-failure path.
+- `testFailureMode: "once"` — fails only the first attempt (`attempt === 1`) and succeeds
+  on the second, proving a failed-then-recovered lifecycle. Its final `attempts` is 2.
+
+The field is stored in the job's payload so every retry behaves consistently. Normal jobs
+without the field are completely unaffected. This is a testing-only hook for demonstrating
+retry behaviour; a real AI provider will replace the simulation later.
 
 ### Current limitations
 
-- No retry scheduling, backoff, or jitter.
 - No stuck-job recovery (`processing` jobs abandoned by a dead worker stay `processing`).
-- No dead-letter view or manual retry (and no transition to `dead`).
+- No dead-letter view or manual retry — a `dead` job stays `dead` until a future phase.
 - No real AI provider — analysis is simulated.
 
 ## Job record design
@@ -342,11 +406,11 @@ store, the table is durable and queryable — no separate queue needed for this 
 | `payload`        | `jsonb`       | Yes      | The job's input, e.g. the customer-review text.                                       |
 | `status`         | `text`        | Yes      | Lifecycle state; constrained to the five values below.                                |
 | `attempts`       | `integer`     | Yes      | Number of times the job has been claimed/started; incremented atomically on claim.   |
-| `max_attempts`   | `integer`     | Yes      | Cap on attempts, copied from configuration when the job is created.                   |
+| `max_attempts`   | `integer`     | Yes      | Retry budget: the job becomes `dead` once `attempts` reaches this value.              |
 | `last_error`     | `text`        | No       | Error message from the most recent failed attempt, when any.                          |
-| `run_at`         | `timestamptz` | Yes      | When the job becomes eligible to run; supports delayed runs and retry backoff.         |
-| `started_at`     | `timestamptz` | No       | Set when a worker claims the job; used to detect stuck jobs.                           |
-| `finished_at`    | `timestamptz` | No       | Set when the job reaches a terminal outcome (currently `succeeded`; later also `dead`). |
+| `run_at`         | `timestamptz` | Yes      | When the job becomes eligible to run; also the scheduled time of the next retry.       |
+| `started_at`     | `timestamptz` | No       | Set when a worker claims the job; cleared when a retry is scheduled; used to detect stuck jobs. |
+| `finished_at`    | `timestamptz` | No       | Set when the job reaches a terminal outcome (`succeeded` or `dead`).                   |
 | `idempotency_key`| `text`        | Yes      | Unique per job (DB-level UNIQUE) so the same work is never enqueued twice.             |
 | `created_at`     | `timestamptz` | Yes      | When the row was inserted.                                                             |
 | `updated_at`     | `timestamptz` | Yes      | Touched automatically on every update to reflect state changes.                        |
@@ -355,22 +419,25 @@ store, the table is durable and queryable — no separate queue needed for this 
 
 | Status       | Meaning                                                                                                   |
 | ------------ | --------------------------------------------------------------------------------------------------------- |
-| `pending`    | Created and eligible to be picked up once `run_at` has passed.                                             |
+| `pending`    | Waiting: either fresh and eligible once `run_at` has passed, or scheduled for a retry at a future `run_at`.  |
 | `processing` | Claimed by a worker and in progress.                                                                      |
-| `succeeded`  | Completed successfully.                                                                                   |
-| `failed`     | The most recent attempt failed, but the job is still allowed to retry.                                     |
-| `dead`       | Attempts exhausted; the job will not run again and requires human intervention.                            |
+| `succeeded`  | Completed successfully; result persisted.                                                                  |
+| `failed`     | Conceptually an individual failed attempt — retryable failures do **not** rest here; they go back to `pending` with a future `run_at`. |
+| `dead`       | Retry budget exhausted; automatic processing stops and the job awaits human intervention.                  |
 
 ### `failed` vs `dead`
 
 These two are easy to confuse, but they mean different things:
 
-- **`failed`** — an *attempt* failed, but the job has attempts left and may be retried later.
-- **`dead`** — the job has exhausted `max_attempts` and will **not** be retried automatically;
-  a human must investigate and decide what to do.
+- **`failed`** — an *individual attempt* failed. If the job still has retry budget
+  (`attempts < max_attempts`), the worker immediately returns it to `pending` with a future
+  `run_at`, so `failed` never becomes the resting state of a retryable job (it must be
+  claimable again). The failure is captured in `last_error` either way.
+- **`dead`** — the job has reached `attempts = max_attempts` and will **not** be retried
+  automatically; `finished_at` is set and a human must investigate and decide what to do.
 
-A job typically goes `failed` a few times and becomes `dead` only after it has used up its
-last allowed attempt.
+A job therefore goes `pending -> processing` repeatedly (with backoff waits in between)
+until its budget is used up, at which point it becomes `dead`.
 
 ### Constraints and indexes
 
@@ -393,8 +460,8 @@ Copy `.env.example` to `.env` and fill in real values. Never commit `.env`.
 | `WORKER_CONCURRENCY`         | `3`       | Max simultaneous jobs a single worker processes.               |
 | `WORKER_POLL_INTERVAL_MS`    | `1000`    | How often the worker polls for eligible jobs.                  |
 | `WORKER_TASK_DELAY_MS`       | `2500`    | Simulated analysis duration (ms) used instead of a real AI call. |
-| `JOB_MAX_ATTEMPTS`           | `5`       | Attempt cap before a job becomes `dead` (future phase).        |
-| `JOB_BASE_DELAY_MS`          | `1000`    | Base retry-backoff delay; used by a future retry phase.        |
+| `JOB_MAX_ATTEMPTS`           | `5`       | Retry budget; the job becomes `dead` when `attempts` reaches it.                    |
+| `JOB_BASE_DELAY_MS`          | `1000`    | Base of the exponential retry backoff; retryDelay = base * 2^(attempt-1) + jitter.   |
 | `JOB_STUCK_TIMEOUT_MS`       | `60000`   | When a `processing` job is considered stuck (future phase).    |
 
 ## Local setup
@@ -452,6 +519,7 @@ background-job-system/
 │   ├── worker/
 │   │   ├── worker.ts                # Poll loop, concurrency cap, graceful shutdown
 │   │   ├── job.handlers.ts          # Simulated review-analysis handler (deterministic)
+│   │   ├── retry.ts                 # Exponential backoff + bounded jitter scheduling
 │   │   └── jobs.worker.repository.ts# Atomic claim + success/failure completion SQL
 │   └── db/
 │       └── migrations/
@@ -508,11 +576,100 @@ background-job-system/
   (job_id) DO NOTHING`.
 - Temporary failure marks a job `failed` with `last_error` (no retries yet).
 
+### Phase 4 — failure, retries, exponential backoff + jitter, and `dead`
+
+- Handled failures are recorded **safely** with a `status = 'processing'` guard so a stale
+  worker can never overwrite a job it no longer owns.
+- **Retryable** failures return the job to `pending` with a future `run_at`,
+  exponential backoff (`JOB_BASE_DELAY_MS * 2^(attempt-1)`) plus bounded jitter
+  (uniform `[0, JOB_BASE_DELAY_MS]`), and `last_error` recorded.
+- **Exhausted** failures (`attempts >= max_attempts`) move the job to `dead` with
+  `finished_at = now()`; no further retry.
+- Worker logs each failure with the attempt number, exponential component, jitter
+  component, final delay, next `run_at`, and the terminal `dead` line.
+- Controlled **`testFailureMode`** (`"always"` / `"once"`) on `POST /api/jobs`, validated
+  with Zod and persisted in the job payload, to demonstrate retry behaviour deterministically.
+- `GET /api/jobs/:id` now returns `runAt` so scheduled retry times are externally observable.
+
 ## What is intentionally NOT implemented yet
 
-- Job **retries**, **backoff scheduling**, and **dead-letter** handling to `dead`.
 - **Stuck-job recovery** (a job left in `processing` by a hard-killed worker stays there).
+- **Dead-letter view / manual retry** — a `dead` job stays `dead` until a future phase.
 - **AI / real review-analysis integration** (analysis is still a deterministic simulation).
 - Authentication, React frontend, Redis/BullMQ queues, Docker.
 
 These are deliberately deferred to later phases.
+
+## Manual verification (Tests A–E)
+
+Prerequisites: API running (`npm start`) and worker running (`npm run worker:start`) in two
+separate terminals, using the default `JOB_MAX_ATTEMPTS = 5` and `JOB_BASE_DELAY_MS = 1000`.
+
+### Test A — normal successful job
+
+```powershell
+$body = @{ review = 'A normal review that should succeed.'; idempotencyKey = 'test-A' } | ConvertTo-Json -Compress
+$r = Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/jobs -ContentType 'application/json' -Body $body
+$r | ConvertTo-Json -Depth 5
+# After ~3 s, inspect until succeeded (attempts=1):
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+```
+
+### Test B — forced 100% failure -> dead
+
+```powershell
+$body = @{
+  review         = 'This job is intentionally failing for retry testing.';
+  idempotencyKey = 'test-B';
+  testFailureMode = 'always'
+} | ConvertTo-Json -Compress
+$r = Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/jobs -ContentType 'application/json' -Body $body
+$r | ConvertTo-Json -Depth 5
+# Repeatedly inspect until the job reaches dead:
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+# With maxAttempts=5 this takes roughly 1+2+4+8 s plus worker delays (a few seconds each).
+# Expected end state: status="dead", attempts=5, finishedAt set, lastError set.
+```
+
+### Test C — backoff evidence
+
+Watch the **worker terminal**. Lines to look for (delays grow across attempts):
+
+```
+[worker-123] job <id> attempt=1 failed
+[worker-123] retry scheduled delayMs=~1xxx exponentialMs=1000 jitterMs=~xxx runAt=...
+[worker-123] claimed job <id> attempts=2 ...
+[worker-123] job <id> attempt=2 failed
+[worker-123] retry scheduled delayMs=~2xxx exponentialMs=2000 jitterMs=~xxx runAt=...
+...
+[worker-123] job <id> attempt=5 dead lastError="..."
+```
+
+Between checks, `GET /api/jobs/:id` exposes `attempts` and `runAt` — `runAt` should keep
+moving forward by the growing delay. Expect `exponentialMs` to be ~1000, ~2000, ~4000,
+~8000 while `delayMs` stays slightly above the exponential due to jitter.
+
+### Test D — no retry after dead
+
+After the job in Test B is `dead`:
+
+```powershell
+Start-Sleep -Seconds 12   # longer than the largest theoretical retry delay (~9 s)
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+# attempts must still be 5 and status must still be "dead"
+```
+
+### Test E — fail-once behaviour (`testFailureMode: "once"`)
+
+```powershell
+$body = @{
+  review          = 'Fails once, then succeeds.';
+  idempotencyKey  = 'test-E';
+  testFailureMode = 'once'
+} | ConvertTo-Json -Compress
+$r = Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/jobs -ContentType 'application/json' -Body $body
+Start-Sleep -Seconds 8
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+# Expected: status="succeeded", attempts=2 (attempt 1 failed + rescheduled; attempt 2 succeeded)
+# Worker log should show attempt=1 failed with a retry, then attempt=2 succeeded.
+```

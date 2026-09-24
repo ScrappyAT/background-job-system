@@ -63,11 +63,35 @@ export async function completeJobSucceeded(
   }
 }
 
-export async function failJob(jobId: string, message: string): Promise<void> {
-  await pool.query(
+export type FailOutcome = 'retry' | 'dead' | 'not_owned';
+
+export async function recordJobFailure(
+  jobId: string,
+  message: string,
+  attempts: number,
+  maxAttempts: number,
+  retryDelayMs: number
+): Promise<FailOutcome> {
+  if (attempts < maxAttempts) {
+    const runAt = new Date(Date.now() + retryDelayMs);
+    const updated = await pool.query(
+      `UPDATE jobs
+       SET status = 'pending',
+           last_error = $2,
+           run_at = $3,
+           started_at = NULL,
+           finished_at = NULL
+       WHERE id = $1 AND status = 'processing'`,
+      [jobId, message, runAt]
+    );
+    return updated.rowCount === 0 ? 'not_owned' : 'retry';
+  }
+
+  const updated = await pool.query(
     `UPDATE jobs
-     SET status = 'failed', last_error = $2
+     SET status = 'dead', last_error = $2, finished_at = now()
      WHERE id = $1 AND status = 'processing'`,
     [jobId, message]
   );
+  return updated.rowCount === 0 ? 'not_owned' : 'dead';
 }

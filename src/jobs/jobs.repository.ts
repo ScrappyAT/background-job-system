@@ -10,6 +10,7 @@ export const JOB_SELECT_COLUMNS = `
 export interface InsertJobInput {
   idempotencyKey: string;
   review: string;
+  testFailureMode?: 'always' | 'once';
   maxAttempts: number;
 }
 
@@ -23,7 +24,12 @@ export async function insertJob(
      RETURNING ${JOB_SELECT_COLUMNS}`,
     [
       'review_analysis',
-      JSON.stringify({ review: input.review }),
+      JSON.stringify({
+        review: input.review,
+        ...(input.testFailureMode
+          ? { testFailureMode: input.testFailureMode }
+          : {}),
+      }),
       input.maxAttempts,
       input.idempotencyKey,
     ]

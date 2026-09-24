@@ -1,7 +1,12 @@
 import { config } from '../config/env';
 
+export interface JobContext {
+  attempt: number;
+}
+
 export type JobHandler = (
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  context: JobContext
 ) => Promise<Record<string, unknown>>;
 
 const handlers: Record<string, JobHandler> = {
@@ -26,11 +31,20 @@ function fnv1a(input: string): string {
 }
 
 async function simulateReviewAnalysis(
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  context: JobContext
 ): Promise<Record<string, unknown>> {
   const review = typeof payload.review === 'string' ? payload.review : '';
+  const testFailureMode = payload.testFailureMode;
 
   await sleep(config.workerTaskDelayMs);
+
+  if (testFailureMode === 'always') {
+    throw new Error('Simulated failure: testFailureMode=always');
+  }
+  if (testFailureMode === 'once' && context.attempt === 1) {
+    throw new Error('Simulated failure: testFailureMode=once (attempt 1)');
+  }
 
   return {
     review,
