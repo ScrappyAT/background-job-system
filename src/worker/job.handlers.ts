@@ -30,14 +30,23 @@ function fnv1a(input: string): string {
   return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
+const TEST_PROCESSING_DELAY_MAX_MS = 120000;
+
 async function simulateReviewAnalysis(
   payload: Record<string, unknown>,
   context: JobContext
 ): Promise<Record<string, unknown>> {
   const review = typeof payload.review === 'string' ? payload.review : '';
   const testFailureMode = payload.testFailureMode;
+  const overrideDelayMs =
+    typeof payload.testProcessingDelayMs === 'number'
+      ? Math.min(
+          TEST_PROCESSING_DELAY_MAX_MS,
+          Math.max(0, Math.trunc(payload.testProcessingDelayMs))
+        )
+      : null;
 
-  await sleep(config.workerTaskDelayMs);
+  await sleep(overrideDelayMs ?? config.workerTaskDelayMs);
 
   if (testFailureMode === 'always') {
     throw new Error('Simulated failure: testFailureMode=always');

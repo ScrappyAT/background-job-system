@@ -11,6 +11,7 @@ export interface InsertJobInput {
   idempotencyKey: string;
   review: string;
   testFailureMode?: 'always' | 'once';
+  testProcessingDelayMs?: number;
   maxAttempts: number;
 }
 
@@ -28,6 +29,9 @@ export async function insertJob(
         review: input.review,
         ...(input.testFailureMode
           ? { testFailureMode: input.testFailureMode }
+          : {}),
+        ...(input.testProcessingDelayMs !== undefined
+          ? { testProcessingDelayMs: input.testProcessingDelayMs }
           : {}),
       }),
       input.maxAttempts,

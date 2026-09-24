@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "worker": "tsx src/worker/worker.ts",
     "worker:start": "node dist/worker/worker.js",
-    "db:migrate": "tsx src/db/migrations/run.ts"
+    "db:migrate": "tsx src/db/migrations/run.ts",
+    "verify:guard": "node scripts/verify-stale-guard.js"
   },
   "keywords": [
     "background-jobs",

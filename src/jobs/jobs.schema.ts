@@ -7,6 +7,7 @@ export const createJobSchema = z.object({
     .trim()
     .min(1, 'idempotencyKey is required and must be a non-empty string'),
   testFailureMode: z.enum(['always', 'once']).optional(),
+  testProcessingDelayMs: z.number().int().min(0).max(120000).optional(),
 });
 
 export type CreateJobInput = z.infer<typeof createJobSchema>;

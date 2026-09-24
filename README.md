@@ -6,11 +6,14 @@ A client submits customer-review text to an API. The API records the work as a *
 and responds immediately; the AI analysis itself runs later, out of band, in a separate
 worker process.
 
-> **Phase 4 status:** handled failures now drive automatic **retries with exponential
-> backoff + jitter**, and jobs become **`dead`** when the retry budget is exhausted.
-> A controlled `testFailureMode` on `POST /api/jobs` makes the retry behaviour
-> demonstrable. Stuck-job recovery, dead-letter view/manual retry, and a real AI provider
-> are **not** implemented yet. See
+> **Phase 5 status:** workers now run a **stuck-job recovery sweep**. A job left in
+> `processing` by a crashed worker is detected once its `started_at` is older than
+> `JOB_STUCK_TIMEOUT_MS` and recovered — returned to `pending` (attempts intact) when it
+> still has retry budget, or moved to `dead` when exhausted. Completion/failure updates
+> carry an **attempt-number ownership guard** so a stale worker can never complete a newer
+> attempt. A controlled `testProcessingDelayMs` hook keeps a job `processing` long enough
+> to demonstrate the crash/recovery lifecycle. Dead-letter view/manual retry and a real AI
+> provider are **not** implemented yet. See
 > [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
 
 ## Tech stack
@@ -75,10 +78,15 @@ Validation:
   makes the simulated handler deliberately throw so retry behaviour can be demonstrated.
   Omit it for normal behaviour. See
   [Controlled test failure mode](#controlled-test-failure-mode).
+- `testProcessingDelayMs` — **optional**, an integer between `0` and `120000` inclusive.
+  Overrides the simulated processing delay for this single job (used to keep a job in
+  `processing` long enough to demonstrate crash recovery). Omit it to use
+  `WORKER_TASK_DELAY_MS` as normal. See
+  [Stuck-job recovery](#stuck-job-recovery).
 
 Both `review` and `idempotencyKey` are trimmed before being stored. Every submitted job is
 created with `type = "review_analysis"`; clients cannot choose an arbitrary job type. The
-testing field is stored inside the job's payload so that retries behave consistently.
+testing fields are stored inside the job's payload so that retries behave consistently.
 
 Success response — HTTP `202 Accepted` (the job was accepted for later processing):
 
@@ -274,13 +282,136 @@ tracks `active` jobs in memory and only ever claims `WORKER_CONCURRENCY - active
 its in-process count never exceeds the configured value. Each running worker process starts
 its own in-memory counter — the cap is per process by design.
 
+### Stuck-job recovery
+
+**What counts as stuck.** A job may be left in `processing` forever if its worker process
+dies mid-job (a crash, a hard kill, or a network partition). The system detects such jobs
+by their **age**:
+
+```
+A job is stuck when  status = 'processing'
+                    AND started_at < now() - JOB_STUCK_TIMEOUT_MS
+```
+
+`JOB_STUCK_TIMEOUT_MS` defaults to `60000` ms. Only `processing` rows older than the
+timeout are touched — `pending`, `succeeded`, `failed`, and `dead` rows are never swept.
+
+**The safe/atomic sweep.** Once per poll cycle each worker runs a bounded
+(batched, `LIMIT = workerConcurrency`) recovery pass using the same single-statement,
+`FOR UPDATE SKIP LOCKED` pattern as claiming:
+
+```sql
+WITH stuck AS (
+  SELECT id
+  FROM jobs
+  WHERE status = 'processing'
+    AND started_at < now() - ($1::int * interval '1 millisecond')
+  ORDER BY started_at, id
+  LIMIT $2
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs j
+SET status     = CASE WHEN j.attempts < j.max_attempts THEN 'pending' ELSE 'dead' END,
+    last_error = CASE WHEN j.attempts < j.max_attempts
+                      THEN 'Recovered after worker timeout'
+                      ELSE 'Recovered after worker timeout (attempts exhausted)' END
+    -- retryable: run_at = now(), started_at = NULL, finished_at = NULL
+    -- exhausted:            started_at kept,    finished_at = now()
+FROM stuck s
+WHERE j.id = s.id
+RETURNING ...;
+```
+
+The row locks, the "is it still `processing` and still older than the cutoff" check, and
+the state transition happen in one atomic statement, so two workers sweeping at the same
+time can never recover the same row in conflicting ways — the second sweeper simply skips
+the already-locked row. The partial index `idx_jobs_stuck_processing` (`started_at` where
+`status = 'processing'`) keeps the lookup cheap.
+
+**Why recovery does not increment `attempts`.** `attempts` was already incremented when
+the crashed worker *claimed* the job. The crashed execution therefore already consumed one
+attempt. If the sweeper incremented again, a single crash would burn two attempts. The
+sweeper leaves `attempts` untouched; the next **real** claim (when the job returns to
+`pending`) increments it again.
+
+**Retryable stuck job** (`attempts < max_attempts`): returned to `pending` with
+`run_at = now()`, `started_at = NULL`, `finished_at = NULL`, and
+`last_error = 'Recovered after worker timeout'`. It becomes immediately eligible for the
+next claim.
+
+**Exhausted stuck job** (`attempts >= max_attempts`): the crashed execution was the last
+allowed attempt, so the job must not run again: `status = 'dead'`,
+`last_error = 'Recovered after worker timeout (attempts exhausted)'`, and
+`finished_at = now()`. `started_at` is kept as a diagnostic.
+
+**Worker logs.** Recovery is logged per job, e.g.:
+
+```
+[worker-123] recovered stuck job <id> attempts=1 status=pending
+[worker-123] claimed job <id> attempts=2 ...
+[worker-123] finished job <id> attempt=2 status=succeeded ...
+```
+
+or, for an exhausted job:
+
+```
+[worker-123] stuck job <id> exhausted attempts=5 status=dead
+```
+
+**Attempt-number ownership guard (stale worker protection).** Completion and failure
+updates are no longer only conditional on `status = 'processing'` — they must also match
+the **attempt number the worker was executing**:
+
+```sql
+-- success
+UPDATE jobs SET status = 'succeeded', ... WHERE id = $1 AND status = 'processing' AND attempts = $2
+-- handled failure
+UPDATE jobs SET status = 'pending'| 'dead', ... WHERE id = $1 AND status = 'processing' AND attempts = $2
+```
+
+Consider Worker A claiming a job as `attempts = 1`, stalling, and being recovered by the
+sweeper. Worker B then claims it as `attempts = 2`. If Worker A later finishes and tries
+to record success or failure, its `attempts = 1` guard no longer matches — the row is
+`attempts = 2` — so its update affects **zero rows** and is ignored (logged
+`stale completion ignored`). Only the worker executing the current attempt can transition
+the job. This is the same single guarded statement as before, just with the attempt number
+added — no distributed locking.
+
+**Why `job_results` stays safe.** The success path runs in one transaction: first the
+guarded `UPDATE ... SET status='succeeded' WHERE ... attempts = $attempt`, and **only if
+that update matched a row** does it insert into `job_results`. Because the guarded
+`UPDATE` is the ownership test and it holds the row lock until commit, a stale worker can
+never insert the authoritative result — its update matches nothing, so it inserts nothing.
+`UNIQUE(job_id)` remains as a final safety net.
+
+**Crash/recovery lifecycle (controlled demonstration):**
+
+```
+pending
+ -> processing (attempt 1)        worker claimed it, started_at set
+ -> worker crashes                job stranded in processing
+ -> remains processing            GET /api/jobs/:id shows processing, attempts=1
+ -> timeout expires               JOB_STUCK_TIMEOUT_MS passes
+ -> sweeper recovers to pending   started_at NULL, last_error "Recovered after worker timeout"
+ -> processing (attempt 2)        next real claim increments attempts to 2
+ -> succeeded
+```
+
+To hold a job in `processing` long enough to demonstrate this by killing a worker, submit
+it with `testProcessingDelayMs` (bounded 0–120000). That single job's simulated handler then
+sleeps the override instead of `WORKER_TASK_DELAY_MS`; all other jobs are unaffected. For a
+clean single-recovery demo keep the worker's `JOB_STUCK_TIMEOUT_MS` **larger** than the delay
+(see [Test F](#test-f--crash-recovery-stuck-job-with-stale-worker-evidence)).
+
 ### Simulated review-analysis handler
 
 There is **no AI provider** yet. `review_analysis` jobs are handled by a deterministic
 simulation that:
 
 1. reads the `review` from the job payload;
-2. waits `WORKER_TASK_DELAY_MS` (default `2500` ms ≈ 2–3 s) to mimic real analysis work;
+2. sleeps to mimic real analysis work — by default `WORKER_TASK_DELAY_MS`
+   (default `2500` ms ≈ 2–3 s), or the job's own `testProcessingDelayMs` (0–120000) when that
+   optional payload field is set;
 3. returns a result derived purely from the review text, e.g.:
 
 ```json
@@ -298,7 +429,8 @@ is recorded and the job is retried (then eventually `dead`) via the normal retry
 
 ### Successful completion and durable results
 
-On success the worker atomically (in one transaction):
+On success the worker updates the job **only if it still owns the current attempt** (see
+the [attempt-number ownership guard](#stuck-job-recovery)) and, in the same transaction:
 
 1. sets the job to `succeeded`, `finished_at = now()`, and clears `last_error`;
 2. writes the result to the **`job_results`** table (new migration `002`):
@@ -310,9 +442,10 @@ On success the worker atomically (in one transaction):
 | `result`     | `jsonb`       | The handler's output.                              |
 | `created_at` | `timestamptz` | When the result row was created.                   |
 
-`job_id` is `UNIQUE` and the insert is `INSERT ... ON CONFLICT (job_id) DO NOTHING`, so a
-job can never produce a second result row even if it were somehow run more than once —
-durable output is idempotent at the database level.
+If the guarded `UPDATE` matched a row, the `job_results` insert runs inside the same
+transaction (`INSERT ... ON CONFLICT (job_id) DO NOTHING` as a final safety net). If the
+worker no longer owns the attempt, the `UPDATE` matches nothing and **no** result is
+written — a stale worker can never leave an output behind.
 
 ### Attempts semantics
 
@@ -328,8 +461,9 @@ second attempt records `attempts = 2`, and a job that exhausts its budget record
 ### Failure, retries, exponential backoff, and dead-lettering
 
 **Failure semantics.** When a handler throws, the worker records the failure safely and
-only if it still owns the job (`status = 'processing'`, so a stale worker can never
-overwrite a job it no longer owns). The decision uses `attempts` vs `max_attempts`, where
+only if it still owns the job — the update is guarded by both `status = 'processing'`
+**and** the attempt number the worker was executing, so a stale worker can never overwrite
+a job owned by a newer attempt. The decision uses `attempts` vs `max_attempts`, where
 `attempts` is the number of the attempt that just failed (it was incremented at claim
 time):
 
@@ -387,7 +521,8 @@ retry behaviour; a real AI provider will replace the simulation later.
 
 ### Current limitations
 
-- No stuck-job recovery (`processing` jobs abandoned by a dead worker stay `processing`).
+- Stuck-job recovery runs only while a worker is alive — if **no** worker runs, nothing
+  sweeps and stranded `processing` jobs stay stranded until a worker starts.
 - No dead-letter view or manual retry — a `dead` job stays `dead` until a future phase.
 - No real AI provider — analysis is simulated.
 
@@ -462,7 +597,7 @@ Copy `.env.example` to `.env` and fill in real values. Never commit `.env`.
 | `WORKER_TASK_DELAY_MS`       | `2500`    | Simulated analysis duration (ms) used instead of a real AI call. |
 | `JOB_MAX_ATTEMPTS`           | `5`       | Retry budget; the job becomes `dead` when `attempts` reaches it.                    |
 | `JOB_BASE_DELAY_MS`          | `1000`    | Base of the exponential retry backoff; retryDelay = base * 2^(attempt-1) + jitter.   |
-| `JOB_STUCK_TIMEOUT_MS`       | `60000`   | When a `processing` job is considered stuck (future phase).    |
+| `JOB_STUCK_TIMEOUT_MS`       | `60000`   | Max age of a `processing` job before the stuck-job sweeper recovers it.            |
 
 ## Local setup
 
@@ -517,15 +652,17 @@ background-job-system/
 │   │   ├── env.ts        # Loads/validates environment config
 │   │   └── database.ts   # pg connection pool built from DATABASE_URL
 │   ├── worker/
-│   │   ├── worker.ts                # Poll loop, concurrency cap, graceful shutdown
+│   │   ├── worker.ts                # Poll loop, stuck-job sweep, concurrency cap, graceful shutdown
 │   │   ├── job.handlers.ts          # Simulated review-analysis handler (deterministic)
 │   │   ├── retry.ts                 # Exponential backoff + bounded jitter scheduling
-│   │   └── jobs.worker.repository.ts# Atomic claim + success/failure completion SQL
-│   └── db/
-│       └── migrations/
-│           ├── 001_create_jobs.sql   # Jobs table (checks, indexes, trigger)
-│           ├── 002_create_job_results.sql  # Durable results (UNIQUE job_id)
-│           └── run.ts                # Migration runner (ordered, tracked, transactional)
+│   │   └── jobs.worker.repository.ts# Atomic claim + stuck recovery + attempt-guarded completion/failure SQL
+│   ├── db/
+│   │   └── migrations/
+│   │       ├── 001_create_jobs.sql   # Jobs table (checks, indexes, trigger)
+│   │       ├── 002_create_job_results.sql  # Durable results (UNIQUE job_id)
+│   │       └── run.ts                # Migration runner (ordered, tracked, transactional)
+├── scripts/
+│   └── verify-stale-guard.js  # Automated demo: a stale worker cannot complete a newer attempt
 ```
 
 ## What is implemented so far
@@ -591,16 +728,36 @@ background-job-system/
   with Zod and persisted in the job payload, to demonstrate retry behaviour deterministically.
 - `GET /api/jobs/:id` now returns `runAt` so scheduled retry times are externally observable.
 
+### Phase 5 — stuck-job recovery and stale-worker protection
+
+- A **stuck-job sweeper** runs inside each worker, once per poll cycle, recovering
+  `processing` jobs whose `started_at` is older than `JOB_STUCK_TIMEOUT_MS`. It uses the
+  same atomic `FOR UPDATE SKIP LOCKED` single-statement pattern as claiming, so concurrent
+  sweepers never recover the same row.
+- **Retryable samples** return to `pending` with `run_at = now()` and `started_at`/`finished_at`
+  cleared; **exhausted** samples become `dead` with `finished_at = now()`. Recovery never
+  increments `attempts` — the crashed execution already consumed an attempt at claim time.
+- **Attempt-number ownership guard**: success and failure updates now require
+  `status = 'processing' AND attempts = <the attempt the worker was executing>`, so a stale
+  worker (attempt 1) can never complete a job that has since been recovered and re-claimed
+  as attempt 2.
+- **`job_results` stays authoritative**: the result insert happens only when the guarded
+  success `UPDATE` matched within the same transaction, so a stale worker cannot persist
+  output.
+- Controlled **`testProcessingDelayMs`** (0–120000) keeps one job in `processing` long
+  enough to demonstrate crash/recovery.
+- **`scripts/verify-stale-guard.js`** (`npm run verify:guard`) — an automated controlled
+  demo that a recovered-and-reclaimed job ignores a stale worker's completion/failure.
+
 ## What is intentionally NOT implemented yet
 
-- **Stuck-job recovery** (a job left in `processing` by a hard-killed worker stays there).
 - **Dead-letter view / manual retry** — a `dead` job stays `dead` until a future phase.
 - **AI / real review-analysis integration** (analysis is still a deterministic simulation).
 - Authentication, React frontend, Redis/BullMQ queues, Docker.
 
 These are deliberately deferred to later phases.
 
-## Manual verification (Tests A–E)
+## Manual verification (Tests A–G)
 
 Prerequisites: API running (`npm start`) and worker running (`npm run worker:start`) in two
 separate terminals, using the default `JOB_MAX_ATTEMPTS = 5` and `JOB_BASE_DELAY_MS = 1000`.
@@ -673,3 +830,121 @@ Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | Convert
 # Expected: status="succeeded", attempts=2 (attempt 1 failed + rescheduled; attempt 2 succeeded)
 # Worker log should show attempt=1 failed with a retry, then attempt=2 succeeded.
 ```
+
+### Test F — crash recovery (stuck job) with stale-worker evidence
+
+Goal: prove that a crashed worker's job is recovered, **not** double-counted, and re-run
+with a higher attempt number — and that the stale worker cannot then complete it.
+
+Prerequisites: `npm run build` done. API runs normally (`npm start`). The worker is started
+**separately** so we can kill it precisely. The worker's stuck timeout must be **larger** than
+the job's simulated delay (otherwise the worker would re-sweep its own in-flight job and the
+demo would churn attempts). Use `JOB_STUCK_TIMEOUT_MS=10000` with `testProcessingDelayMs=8000`
+for the worker process (override in that process only; the committed default stays 60000).
+Keep the API at defaults and let the worker's env differ:
+
+```powershell
+# Terminal 1 — API (defaults, no timeout change needed):
+npm start
+
+# Terminal 2 — worker with a SHORT stuck timeout (10 s) so the test is quick:
+$env:JOB_STUCK_TIMEOUT_MS = '10000'
+npm run worker:start
+```
+
+> On Windows, use `$env:VAR = 'value'` (PowerShell) before starting the worker. In cmd.exe
+> it would be `set VAR=value`.
+
+**Step 1 — submit a job that stays `processing` for 8 s** (a normal job finishes in ~2.5 s,
+too fast to catch), then **Screenshot A** while it is mid-flight:
+
+```powershell
+$body = @{
+  review                = 'Crash recovery demo.';
+  idempotencyKey        = 'crash-recovery';
+  testProcessingDelayMs = 8000
+} | ConvertTo-Json -Compress
+$r = Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/jobs -ContentType 'application/json' -Body $body
+$r | ConvertTo-Json -Depth 5   # note $r.job.id
+
+Start-Sleep -Seconds 4
+
+# Screenshot A — worker log shows "claimed job ... attempts=1", and GET shows:
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+# Expected: status="processing", attempts=1, startedAt set
+```
+
+**Step 2 — force-kill the worker while the job is still processing** (within the 8 s delay
+window; graceful Ctrl+C waits for in-flight jobs, so a hard kill is required):
+
+```powershell
+# Find the exact worker PID (matches this project's worker, not the API/node):
+$wk = Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+      Where-Object { $_.CommandLine -like '*dist\worker\worker.js*' }
+$wk | ForEach-Object { "Killing $($_.ProcessId): $($_.CommandLine)" }
+$wk | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
+
+Or, to start the worker under your control and kill it by PID:
+
+```powershell
+$env:JOB_STUCK_TIMEOUT_MS = '10000'
+$wk = Start-Process node -ArgumentList 'dist/worker/worker.js' -WorkingDirectory (Get-Location) -PassThru
+Write-Host "worker PID: $($wk.Id)"
+Stop-Process -Id $wk.Id -Force
+```
+
+**Screenshot B** — job is stranded in `processing`; `GET /api/jobs/:id` still shows
+`status="processing"`, `attempts=1`, `startedAt` set, worker log silent (worker dead):
+
+```powershell
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+```
+
+**Step 3 — restart the worker and watch recovery.** The job becomes stuck once its age from
+the original `started_at` passes 10 s, so within ~10 s of restart it is recovered (pending,
+attempts **still 1** — not double-counted), then re-claimed (attempts=2) and completed (the
+8 s delay is under the 10 s timeout, so no further re-sweeps):
+
+```powershell
+$env:JOB_STUCK_TIMEOUT_MS = '10000'
+npm run worker:start
+# wait ~20 s, then inspect
+```
+
+**Screenshot C** — worker log sequence:
+
+```
+[worker-...] recovered stuck job <id> attempts=1 status=pending
+[worker-...] claimed job <id> attempts=2 ...
+[worker-...] finished job <id> attempt=2 status=succeeded ...
+```
+
+And `GET /api/jobs/:id` shows `status="succeeded"`, `attempts=2`, a `job_result`, and
+`lastError` cleared (the recovered-jump was cosmetic; `last_error` reflects completed work):
+
+```powershell
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+```
+
+Result review: three screenshots (A claim started, B stranded attempt 1, C recovered +
+attempt 2 complete). Recovery **did not** use up an extra attempt — the job finished with
+`attempts=2`, not 3.
+
+### Test G — automated stale-worker guard (`npm run verify:guard`)
+
+Proves a recovered-and-reclaimed job is immune to its stale worker (attempt 1) finishing or
+failing it, while the current owner (attempt 2) completes normally. Build first, then run
+(no server or worker needed; it talks to PostgreSQL directly through the built repository):
+
+```powershell
+npm run build
+npm run verify:guard
+# ALL PASS on success; exits non-zero on failure.
+```
+
+Checks in order: claim → processing/attempts=1 → backdate started_at → recover → pending
+(attempts still 1) → re-claim → attempts=2 → stale `completeJobSucceeded(id, attempt=1)`
+returns `false` → stale failure records `not_owned` → row still processing/attempts=2 and
+no `job_results` → `completeJobSucceeded(id, attempt=2)` returns `true` → result row exists
+with origin `worker-B`. The job row is cleaned up afterwards.

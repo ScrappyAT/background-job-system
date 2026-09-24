@@ -7,6 +7,7 @@ import {
   claimJobs,
   completeJobSucceeded,
   recordJobFailure,
+  recoverStuckJobs,
 } from './jobs.worker.repository';
 import { computeRetryDelay } from './retry';
 
@@ -48,6 +49,13 @@ class WorkerProcess {
   private async loop(): Promise<void> {
     console.log(`[${this.id}] poll loop started`);
     while (!this.shuttingDown) {
+      if (!this.shuttingDown) {
+        try {
+          await this.sweepStuckJobs();
+        } catch (error) {
+          console.error(`[${this.id}] stuck-job sweep failed:`, error);
+        }
+      }
       const freeSlots = this.concurrency - this.active.size;
       if (freeSlots > 0) {
         try {
@@ -68,6 +76,24 @@ class WorkerProcess {
       await sleep(this.pollIntervalMs);
     }
     console.log(`[${this.id}] poll loop stopped`);
+  }
+
+  private async sweepStuckJobs(): Promise<void> {
+    const recovered = await recoverStuckJobs(
+      config.jobStuckTimeoutMs,
+      this.concurrency
+    );
+    for (const job of recovered) {
+      if (job.status === 'dead') {
+        console.log(
+          `[${this.id}] stuck job ${job.id} exhausted attempts=${job.attempts} status=dead`
+        );
+      } else {
+        console.log(
+          `[${this.id}] recovered stuck job ${job.id} attempts=${job.attempts} status=pending`
+        );
+      }
+    }
   }
 
   private dispatch(job: JobRow): void {
@@ -92,11 +118,17 @@ class WorkerProcess {
         throw new Error(`no handler registered for job type "${job.type}"`);
       }
       const result = await handler(job.payload, { attempt });
-      await completeJobSucceeded(job.id, result);
-      console.log(
-        `[${this.id}] finished job ${job.id} attempt=${attempt} status=succeeded ` +
-          `active=${this.active.size - 1}/${this.concurrency}`
-      );
+      const owned = await completeJobSucceeded(job.id, attempt, result);
+      if (owned) {
+        console.log(
+          `[${this.id}] finished job ${job.id} attempt=${attempt} status=succeeded ` +
+            `active=${this.active.size - 1}/${this.concurrency}`
+        );
+      } else {
+        console.log(
+          `[${this.id}] job ${job.id} attempt=${attempt} stale completion ignored (no longer owned)`
+        );
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const schedule = computeRetryDelay(attempt, config.jobBaseDelayMs);

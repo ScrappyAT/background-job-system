@@ -13,11 +13,13 @@ export async function enqueueReviewJob(input: {
   review: string;
   idempotencyKey: string;
   testFailureMode?: 'always' | 'once';
+  testProcessingDelayMs?: number;
 }): Promise<EnqueuedJob> {
   const created = await insertJob({
     review: input.review,
     idempotencyKey: input.idempotencyKey,
     testFailureMode: input.testFailureMode,
+    testProcessingDelayMs: input.testProcessingDelayMs,
     maxAttempts: config.jobMaxAttempts,
   });
 
