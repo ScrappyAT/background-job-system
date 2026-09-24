@@ -1,0 +1,33 @@
+{
+  "name": "background-job-system",
+  "version": "1.0.0",
+  "description": "Background job system for asynchronous AI customer-review analysis",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc && node -e \"require('fs').cpSync('src/db/migrations','dist/db/migrations',{recursive:true,filter:(s)=>require('fs').statSync(s).isDirectory()||s.endsWith('.sql')})\"",
+    "start": "node dist/server.js",
+    "db:migrate": "tsx src/db/migrations/run.ts"
+  },
+  "keywords": [
+    "background-jobs",
+    "postgresql",
+    "express",
+    "typescript"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^18.0.3",
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.2",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
