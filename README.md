@@ -6,14 +6,15 @@ A client submits customer-review text to an API. The API records the work as a *
 and responds immediately; the AI analysis itself runs later, out of band, in a separate
 worker process.
 
-> **Phase 6 status:** the system now has a **dead-letter view** — `GET /api/jobs/dead`
-> returns only `dead` jobs (newest first) with enough context to understand the failure —
-> and **manual retry** — `POST /api/jobs/:id/retry` atomically returns a `dead` job to
-> `pending` with a fresh retry budget (same job id, payload, idempotency key; `maxAttempts`
-> unchanged). A minimal operational page at `GET /dead-jobs` inspects and retries dead
-> jobs. A real AI provider and authentication are **not** implemented yet. See
-> [Dead-letter view and manual retry](#dead-letter-view-and-manual-retry) and
-> [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
+> **Phase 7 status:** `review_analysis` jobs now perform a **real DeepSeek API call**
+> (OpenAI-compatible) instead of a deterministic simulation. The response is parsed and
+> validated locally with Zod (incl. a verbatim-quote check) before being persisted as the
+> job's durable result. Provider failures (and validation rejections) are treated like any
+> other handler failure, so they flow through the existing retry/backoff/dead-letter
+> lifecycle. Requires `DEEPSEEK_API_KEY` for real work; `testFailureMode` break-tests still
+> fail **before** the provider call. Authentication is **not** implemented yet. See
+> [Review-analysis handler (real DeepSeek API)](#review-analysis-handler-real-deepseek-api)
+> and [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
 
 ## Tech stack
 
@@ -23,6 +24,8 @@ worker process.
 - **PostgreSQL** persistent store
 - **pg** PostgreSQL driver for Node
 - **dotenv** for environment configuration
+- **OpenAI SDK** (official) pointed at the **DeepSeek** API for real review analysis
+- **zod** for runtime validation (payloads and AI output)
 
 Deliberately excluded for now: authentication, React, queues (BullMQ/Redis), Docker, and
 any other libraries that Phase 1 does not require.
@@ -74,11 +77,12 @@ Validation:
 - `review` — required, must be a non-empty string after trimming.
 - `idempotencyKey` — required, must be a non-empty string after trimming.
 - `testFailureMode` — **optional**, must be `"always"` or `"once"`. A controlled hook that
-  makes the simulated handler deliberately throw so retry behaviour can be demonstrated.
-  Omit it for normal behaviour. See
+  makes the review-analysis handler deliberately throw **before** any real DeepSeek call so
+  retry behaviour can be demonstrated without spending a provider request. Omit it for
+  normal (real) behaviour. See
   [Controlled test failure mode](#controlled-test-failure-mode).
 - `testProcessingDelayMs` — **optional**, an integer between `0` and `120000` inclusive.
-  Overrides the simulated processing delay for this single job (used to keep a job in
+  Overrides the artificial processing delay for this single job (used to keep a job in
   `processing` long enough to demonstrate crash recovery). Omit it to use
   `WORKER_TASK_DELAY_MS` as normal. See
   [Stuck-job recovery](#stuck-job-recovery).
@@ -397,34 +401,53 @@ pending
 ```
 
 To hold a job in `processing` long enough to demonstrate this by killing a worker, submit
-it with `testProcessingDelayMs` (bounded 0–120000). That single job's simulated handler then
+it with `testProcessingDelayMs` (bounded 0–120000). That single job's handler then
 sleeps the override instead of `WORKER_TASK_DELAY_MS`; all other jobs are unaffected. For a
 clean single-recovery demo keep the worker's `JOB_STUCK_TIMEOUT_MS` **larger** than the delay
 (see [Test F](#test-f--crash-recovery-stuck-job-with-stale-worker-evidence)).
 
-### Simulated review-analysis handler
+### Review-analysis handler (real DeepSeek API)
 
-There is **no AI provider** yet. `review_analysis` jobs are handled by a deterministic
-simulation that:
+`review_analysis` jobs call the **DeepSeek API** (OpenAI-compatible) via the official
+OpenAI SDK. The handler:
 
-1. reads the `review` from the job payload;
-2. sleeps to mimic real analysis work — by default `WORKER_TASK_DELAY_MS`
-   (default `2500` ms ≈ 2–3 s), or the job's own `testProcessingDelayMs` (0–120000) when that
-   optional payload field is set;
-3. returns a result derived purely from the review text, e.g.:
+1. reads the `review` from the job payload (a non-empty string — the job schema guarantees
+   this at enqueue time);
+2. applies the artificial processing delay — by default `WORKER_TASK_DELAY_MS`
+   (default `2500` ms), or the job's own `testProcessingDelayMs` (0–120000) when that
+   optional payload field is set (for controlled crash-recovery demos);
+3. runs the configured `testFailureMode` break-tests (there is **no** DeepSeek call in those
+   paths — see below);
+4. sends the review to `https://api.deepseek.com` with `response_format: { type: 'json_object' }`
+   using `deepseek-flash` (default; override with `DEEPSEEK_MODEL`), asking the model to
+   return **only** a JSON object with exactly these fields:
 
 ```json
 {
-  "review": "The battery life is great but the earbuds are uncomfortable.",
-  "processed": true,
-  "summary": "Simulated review analysis completed",
-  "reviewFingerprint": "9cf9d5a7"
+  "sentiment": "positive",
+  "rating": 4,
+  "themes": ["battery life", "comfort"],
+  "complaints": ["earbuds are uncomfortable"],
+  "quote": "the battery life is great but the earbuds are uncomfortable"
 }
 ```
 
-`reviewFingerprint` is a deterministic hash of the review, so the same review always
-produces the same result. Unknown job types are treated like any other failure: the error
-is recorded and the job is retried (then eventually `dead`) via the normal retry path.
+5. **validates the output locally** — JSON mode is guidance, not a guarantee — with a Zod
+   schema (`sentiment` ∈ positive|negative|mixed, `rating` an integer 1–5, `themes`/
+   `complaints` arrays of strings, `quote` a non-empty string), and additionally checks that
+   the returned `quote` appears **verbatim** in the original review text.
+
+Any failure — missing `DEEPSEEK_API_KEY`, provider/HTTP error, empty response, invalid
+JSON, failed schema validation, or a mismatched quote — **throws**, and the job flows
+through the normal failure/retry/backoff/dead lifecycle exactly like any other handler
+error. The client does **not** retry internally: `maxRetries: 0` in the OpenAI SDK config,
+so all retry responsibility stays with the job system. The provider request (not the API
+key) is bounded by `DEEPSEEK_TIMEOUT_MS` (default 60000).
+
+The successful validated object becomes the durable `job_results.result`. Worker logs
+include the model, request duration, and outcome — never the API key, Authorization header,
+or the full provider response. Unknown job types are treated like any other failure: the
+error is recorded and the job is retried (then eventually `dead`) via the normal retry path.
 
 ### Successful completion and durable results
 
@@ -503,20 +526,22 @@ pending
   -> dead            (when attempts reaches max_attempts)
 ```
 
-**Controlled test failure mode.** Because there is no real AI provider yet, the simulated
-`review_analysis` handler can be told to fail deliberately via an optional `testFailureMode`
-field on `POST /api/jobs` (only `"always"` and `"once"` are accepted; anything else is
-rejected with `422`):
+**Controlled test failure mode.** An optional `testFailureMode` field on `POST /api/jobs`
+(only `"always"` and `"once"` are accepted; anything else is rejected with `422`) makes the
+handler fail deliberately **before** the DeepSeek call, so the retry lifecycle can be
+demonstrated deterministically — without a real provider request (no API key needed for
+these paths):
 
 - `testFailureMode: "always"` — every attempt throws a predictable error, so the job is
   guaranteed to burn through all attempts and end `dead`. This is what lets us prove the
   100%-failure path.
 - `testFailureMode: "once"` — fails only the first attempt (`attempt === 1`) and succeeds
-  on the second, proving a failed-then-recovered lifecycle. Its final `attempts` is 2.
+  on the second, proving a failed-then-recovered lifecycle. Its final `attempts` is 2; the
+  second attempt performs the real DeepSeek call, so it requires `DEEPSEEK_API_KEY` to
+  actually succeed.
 
 The field is stored in the job's payload so every retry behaves consistently. Normal jobs
-without the field are completely unaffected. This is a testing-only hook for demonstrating
-retry behaviour; a real AI provider will replace the simulation later.
+without the field are completely unaffected and always take the real DeepSeek path.
 
 ### Current limitations
 
@@ -527,7 +552,11 @@ retry behaviour; a real AI provider will replace the simulation later.
 - A manually retried job keeps its **original payload**. If that payload contained
   `testFailureMode: "always"`, the job simply fails again and returns to `dead` (expected;
   there is no payload-mutation endpoint by design).
-- No real AI provider — analysis is simulated.
+- Real analysis requires a **`DEEPSEEK_API_KEY`** in `.env`. Without one, normal jobs fail
+  with a provider error and go down the retry/backoff/dead path (never silently succeed),
+  and `testFailureMode: "once"` cannot complete its second attempt.
+- Only **DeepSeek** is wired as a provider; the OpenAI-SDK integration is DeepSeek-specific
+  (`baseURL https://api.deepseek.com`, `deepseek-flash`).
 
 ## Dead-letter view and manual retry
 
@@ -682,10 +711,13 @@ Copy `.env.example` to `.env` and fill in real values. Never commit `.env`.
 | `DATABASE_URL`               | —         | PostgreSQL connection string (required).                       |
 | `WORKER_CONCURRENCY`         | `3`       | Max simultaneous jobs a single worker processes.               |
 | `WORKER_POLL_INTERVAL_MS`    | `1000`    | How often the worker polls for eligible jobs.                  |
-| `WORKER_TASK_DELAY_MS`       | `2500`    | Simulated analysis duration (ms) used instead of a real AI call. |
+| `WORKER_TASK_DELAY_MS`       | `2500`    | Baseline artificial delay (ms) before analysis; `testProcessingDelayMs` on a job overrides it. |
 | `JOB_MAX_ATTEMPTS`           | `5`       | Retry budget; the job becomes `dead` when `attempts` reaches it.                    |
 | `JOB_BASE_DELAY_MS`          | `1000`    | Base of the exponential retry backoff; retryDelay = base * 2^(attempt-1) + jitter.   |
 | `JOB_STUCK_TIMEOUT_MS`       | `60000`   | Max age of a `processing` job before the stuck-job sweeper recovers it.            |
+| `DEEPSEEK_API_KEY`           | —         | DeepSeek API key (required for real analysis). Leave blank in shared files; never commit. |
+| `DEEPSEEK_MODEL`             | `deepseek-flash` | Model used for review analysis (DeepSeek's current model).                     |
+| `DEEPSEEK_TIMEOUT_MS`        | `60000`   | Provider request timeout (ms); worker retries handle the rest.                     |
 
 ## Local setup
 
@@ -698,6 +730,7 @@ npm install
 # 2. Create your local environment file
 Copy-Item .env.example .env
 #    ...then edit .env and set DATABASE_URL to your PostgreSQL instance
+#    (and DEEPSEEK_API_KEY when you want real review analysis)
 
 # 3. Create the schema
 npm run db:migrate
@@ -742,7 +775,8 @@ background-job-system/
 │   │   └── database.ts   # pg connection pool built from DATABASE_URL
 │   ├── worker/
 │   │   ├── worker.ts                # Poll loop, stuck-job sweep, concurrency cap, graceful shutdown
-│   │   ├── job.handlers.ts          # Simulated review-analysis handler (deterministic)
+│   │   ├── job.handlers.ts          # review_analysis handler (real DeepSeek call + break-test hooks)
+│   │   ├── deepseek.client.ts       # OpenAI SDK → DeepSeek, JSON mode, local Zod + quote validation
 │   │   ├── retry.ts                 # Exponential backoff + bounded jitter scheduling
 │   │   └── jobs.worker.repository.ts# Atomic claim + stuck recovery + attempt-guarded completion/failure SQL
 │   ├── db/
@@ -795,8 +829,9 @@ background-job-system/
   FROM` + `RETURNING` in one statement, so no job can be claimed twice even with multiple
   workers running (verified by running two workers concurrently).
 - `attempts` incremented atomically at claim time.
-- A **simulated review-analysis handler** (deterministic result + `reviewFingerprint`,
-  delay configurable via `WORKER_TASK_DELAY_MS`).
+- A **review-analysis handler** — deterministic simulation in Phase 3, and since Phase 7 a
+  **real DeepSeek API call** (openai SDK, JSON object mode, local validation) with a delay
+  configurable via `WORKER_TASK_DELAY_MS`.
 - Migration `002_create_job_results.sql`: durable `job_results` table with `UNIQUE
   job_id`, written atomically with the job's success via `INSERT ... ON CONFLICT
   (job_id) DO NOTHING`.
@@ -852,11 +887,28 @@ background-job-system/
 - **No schema, worker, retry/backoff, or claiming-logic changes** — the worker picks up a
   manually retried job through the existing `pending` + `run_at <= now()` path.
 
+### Phase 7 — real DeepSeek review analysis
+
+- `review_analysis` jobs now call the **DeepSeek API** through the official OpenAI SDK
+  (base URL `https://api.deepseek.com`, no internal retries) instead of a deterministic
+  simulation; the default model is **`deepseek-flash`** (`DEEPSEEK_MODEL`, configurable).
+- The response is forced to JSON (`response_format: { type: 'json_object' }`) and then
+  **validated locally with Zod** — `sentiment`, integer `rating` 1–5, `themes`/
+  `complaints` string arrays, `quote` — plus a **verbatim-quote check** against the original
+  review text. Any failure throws, so provider or validation errors flow through the
+  existing retry/backoff/dead lifecycle; the job system alone owns retries.
+- `DEEPSEEK_API_KEY` is **optional at boot** — without it, real (non-test) jobs fail with a
+  clear provider error and retry/back off. `testFailureMode` break-tests still throw
+  **before** any DeepSeek call, so they never need a key. The test delay
+  (`testProcessingDelayMs`/`WORKER_TASK_DELAY_MS`) is preserved as a test/demo-only sleep.
+- No secrets are logged or stored beyond env: logs carry model, duration, and outcome only.
+- Durable results and the attempt-number ownership guard are **unchanged** — success writes
+  `job_results` atomically with the guarded completion.
+
 ## What is intentionally NOT implemented yet
 
-- **AI / real review-analysis integration** (analysis is still a deterministic simulation).
 - Authentication, job-edit/payload-mutation endpoints (a retried job keeps its payload),
-  React frontend, Redis/BullMQ queues, Docker.
+  React frontend, other AI providers (only DeepSeek is wired), Redis/BullMQ queues, Docker.
 
 These are deliberately deferred to later phases.
 
@@ -871,8 +923,10 @@ separate terminals, using the default `JOB_MAX_ATTEMPTS = 5` and `JOB_BASE_DELAY
 $body = @{ review = 'A normal review that should succeed.'; idempotencyKey = 'test-A' } | ConvertTo-Json -Compress
 $r = Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/jobs -ContentType 'application/json' -Body $body
 $r | ConvertTo-Json -Depth 5
-# After ~3 s, inspect until succeeded (attempts=1):
+# With a real DEEPSEEK_API_KEY in .env: after the artificial delay the worker calls
+# DeepSeek and the job succeeds (attempts=1) with the structured analysis in the result:
 Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+# Without a key, the same job fails with the provider error and retries until it ends dead.
 ```
 
 ### Test B — forced 100% failure -> dead

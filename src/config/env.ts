@@ -22,6 +22,11 @@ function requiredFromEnv(name: string): string {
   return value;
 }
 
+function optionalFromEnv(name: string): string | undefined {
+  const value = process.env[name];
+  return value === undefined || value === '' ? undefined : value;
+}
+
 export const config = {
   port: intFromEnv('PORT', 3000),
   databaseUrl: requiredFromEnv('DATABASE_URL'),
@@ -31,6 +36,9 @@ export const config = {
   jobStuckTimeoutMs: intFromEnv('JOB_STUCK_TIMEOUT_MS', 60000),
   workerPollIntervalMs: intFromEnv('WORKER_POLL_INTERVAL_MS', 1000),
   workerTaskDelayMs: intFromEnv('WORKER_TASK_DELAY_MS', 2500),
+  deepseekApiKey: optionalFromEnv('DEEPSEEK_API_KEY') ?? null,
+  deepseekModel: optionalFromEnv('DEEPSEEK_MODEL') ?? 'deepseek-flash',
+  deepseekTimeoutMs: intFromEnv('DEEPSEEK_TIMEOUT_MS', 60000),
 } as const;
 
 export type AppConfig = typeof config;

@@ -1,5 +1,7 @@
 import { config } from '../config/env';
 
+import { analyzeReview } from './deepseek.client';
+
 export interface JobContext {
   attempt: number;
 }
@@ -10,7 +12,7 @@ export type JobHandler = (
 ) => Promise<Record<string, unknown>>;
 
 const handlers: Record<string, JobHandler> = {
-  review_analysis: simulateReviewAnalysis,
+  review_analysis: reviewAnalysis,
 };
 
 export function getHandler(type: string): JobHandler | undefined {
@@ -21,22 +23,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function fnv1a(input: string): string {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0');
-}
-
 const TEST_PROCESSING_DELAY_MAX_MS = 120000;
 
-async function simulateReviewAnalysis(
+async function reviewAnalysis(
   payload: Record<string, unknown>,
   context: JobContext
 ): Promise<Record<string, unknown>> {
   const review = typeof payload.review === 'string' ? payload.review : '';
+  if (review === '') {
+    throw new Error('review payload is missing or empty');
+  }
   const testFailureMode = payload.testFailureMode;
   const overrideDelayMs =
     typeof payload.testProcessingDelayMs === 'number'
@@ -55,10 +51,5 @@ async function simulateReviewAnalysis(
     throw new Error('Simulated failure: testFailureMode=once (attempt 1)');
   }
 
-  return {
-    review,
-    processed: true,
-    summary: 'Simulated review analysis completed',
-    reviewFingerprint: fnv1a(review),
-  };
+  return analyzeReview(review);
 }
