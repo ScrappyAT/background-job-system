@@ -786,6 +786,8 @@ background-job-system/
 │   │       └── run.ts                # Migration runner (ordered, tracked, transactional)
 ├── scripts/
 │   └── verify-stale-guard.js  # Automated demo: a stale worker cannot complete a newer attempt
+├── evidence/
+│   └── *.png                  # Committed screenshots/transcripts of manual verification
 ```
 
 ## What is implemented so far
@@ -912,7 +914,7 @@ background-job-system/
 
 These are deliberately deferred to later phases.
 
-## Manual verification (Tests A–H)
+## Manual verification (Tests A–I)
 
 Prerequisites: API running (`npm start`) and worker running (`npm run worker:start`) in two
 separate terminals, using the default `JOB_MAX_ATTEMPTS = 5` and `JOB_BASE_DELAY_MS = 1000`.
@@ -1172,3 +1174,280 @@ so a payload that always fails (or an environment that still causes the original
 will fail again. That is the intended, honest behaviour. To observe a successful post-retry
 run you would retry a job whose failure cause is transient or environmental (e.g. it died
 temporarily for reasons unrelated to the payload) — no extra endpoints were added for this.
+
+### Test I — 50-job concurrency cap (break test)
+
+Goal: flood the queue with 50 jobs **before** the worker starts, then prove the worker never
+runs more than `WORKER_CONCURRENCY` jobs at once.
+
+```powershell
+# 1. Enqueue with each job budget-limited to ONE execution. The retry decision uses the
+#    job's STORED max_attempts (copied from the enqueuing process's JOB_MAX_ATTEMPTS),
+#    so set it on the API BEFORE submitting — the worker-side setting is irrelevant.
+$env:JOB_MAX_ATTEMPTS = '1'
+npm start                    # terminal 1 — API (enqueues with maxAttempts=1)
+
+# 2. Enqueue 50 jobs (worker NOT running yet), all pending:
+#    - unique idempotencyKeys
+#    - testProcessingDelayMs = 2500  (keeps each job 'processing' 2.5 s so concurrency is observable)
+#    - testFailureMode = 'always'    (controlled failure BEFORE the DeepSeek call = zero provider calls)
+1..50 | ForEach-Object {
+  $body = @{
+    review                = "Fifty-job concurrency burst #$_"
+    idempotencyKey        = "conc-$([DateTime]::Now.Ticks)-$_"
+    testProcessingDelayMs = 2500
+    testFailureMode       = 'always'
+  } | ConvertTo-Json -Compress
+  Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/jobs -ContentType 'application/json' -Body $body | Out-Null
+}
+
+# 3. Confirm 50 pending, then start the worker with the concurrency cap under test:
+$env:WORKER_CONCURRENCY = '3'
+npm run worker:start       # terminal 2
+
+# 4. Watch the worker log — expect repeated:
+#    claimed job ... active=1/3
+#    claimed job ... active=2/3
+#    claimed job ... active=3/3
+#    (and NEVER active=4/3)
+```
+
+Expected outcome: `active=N/3` with `N` never exceeding 3. Each job sleeps its 2.5 s delay,
+fails locally (`testFailureMode: always` — thrown **before** the DeepSeek call), and with
+`maxAttempts=1` goes straight to `dead` (attempts=1), freeing a slot for the next eligible
+job. Because the forced failure short-circuits before the provider call, this break test
+performs **zero DeepSeek API requests**.
+
+## Verified Results and Evidence
+
+The results below are what was **actually observed** during manual verification. Each entry
+links the screenshot committed under `evidence/`; the screenshots are the committed
+machine-generated record of the runs (worker logs, API responses, dead-letter page, database
+state), while the timings and transitions below were observed live.
+
+### 1. Database-backed idempotency
+
+Observed:
+- The same `idempotencyKey` was submitted twice.
+- Both requests resolved to a **single** job (the same job `id` in both responses).
+- The duplicate request did **not** create a second job or alter the original row.
+
+Evidence:
+- [View evidence — 01-idempotency](evidence/01-idempotency.png)
+
+### 2. Retry, exponential backoff, jitter, and dead transition
+
+Observed (forced 100% failure via `testFailureMode: always`, `JOB_MAX_ATTEMPTS=5`,
+`JOB_BASE_DELAY_MS=1000`):
+- Retry delays grew across attempts, observed approximately:
+  - attempt 1 → 2: **1365 ms**
+  - attempt 2 → 3: **2164 ms**
+  - attempt 3 → 4: **4749 ms**
+  - attempt 4 → 5: **8457 ms**
+- `attempts` increased on each execution/claim (1 → 2 → 3 → 4 → 5).
+- Retryable failures returned the job to **`pending`** with a **future `runAt`**.
+- The delay increased between attempts (exponential component `JOB_BASE_DELAY_MS·2^(attempt-1)`
+  plus a bounded jitter of `[0, JOB_BASE_DELAY_MS]`).
+- After attempt 5 the job became **`dead`**, and **no further retry occurred** (checked after
+  longer than the largest theoretical delay).
+
+> **On jitter:** jitter is a random whole number in `[0, JOB_BASE_DELAY_MS]`, so exact
+> delays vary between runs — only the exponential trend (1000, 2000, 4000, 8000 base) is
+> deterministic.
+
+Evidence:
+- [View evidence — 03-backoff-retries](evidence/03-backoff-retries.png)
+- [View evidence — 04-dead-job-no-further-retry](evidence/04-dead-job-no-further-retry.png)
+
+### 3. Worker crash and stuck-job recovery
+
+Test job observed: `136d90b9-f334-466d-95e8-7b34f12e635d`
+
+Observed:
+- Worker A claimed the job as attempt **1** (`status=processing`, `started_at` set).
+- The job was `processing` when Worker A was force-killed mid-job.
+- Immediately after the kill, the database still showed `status=processing`, `attempts=1`,
+  `started_at` set — nothing auto-changed.
+- After the configured stuck timeout, worker B's sweeper recovered the job to `pending`.
+- Recovery did **NOT** increment `attempts` (still 1).
+- Worker B re-claimed it as attempt **2**.
+- The job ultimately completed `succeeded`, and `finishedAt` was populated.
+
+> The job finished with `attempts=2`, not 3 — the crash consumed exactly one attempt (at claim
+> time); the sweep consumed none.
+
+Evidence:
+- [View evidence — before kill](evidence/05-stuck-before-kill.png)
+- [View evidence — after kill](evidence/06-stuck-after-kill.png)
+- [View evidence — recovery](evidence/07-stuck-recovery.png)
+- [View evidence — recovery completed](evidence/08-stuck-recovery-completed.png)
+
+### 4. Dead-letter view and manual retry
+
+Test job observed: `158e6a43-4dae-41da-8bcc-bb70c2cae546`
+
+Observed:
+- Forced failures (`testFailureMode: always`) exhausted the retry budget → `dead`.
+- The dead-letter page (`GET /dead-jobs`) displayed the job ID, pretty-printed payload,
+  attempts/maxAttempts, last error, and timestamps.
+- Manual Retry reused the **same job ID** (no duplicate job was created).
+- Retry reset `attempts` to **0** and returned `status` to **`pending`**.
+- `lastError`, `startedAt`, and `finishedAt` were cleared.
+- The idempotency key and `maxAttempts` were preserved.
+
+Evidence:
+- [View evidence — dead-letter view](evidence/09-dead-letter-view.png)
+- [View evidence — manual retry reset](evidence/10-manual-retry-reset.png)
+
+### 5. Two-worker atomic-claim test
+
+Observed:
+- Two worker processes ran simultaneously: `worker-42324` and `worker-7920`.
+- 12 jobs were processed.
+- Work was distributed **6/6** across the two worker IDs.
+- **No job ID was claimed by both workers** (no double execution).
+
+The implementation prevents double-claiming with a single atomic SQL statement:
+`SELECT ... FOR UPDATE SKIP LOCKED` merged with the `UPDATE ... RETURNING`. Rows already
+locked by another worker are **skipped**, and the `pending → processing` transition happens
+in the very statement that takes the lock — so two workers can never both claim the same
+eligible row. (The in-process `active` set enforces `WORKER_CONCURRENCY` per worker; the SQL
+enforces exclusivity across workers.)
+
+Evidence:
+- [View evidence — worker 1](evidence/05-two-workers-worker-1.png)
+- [View evidence — worker 2](evidence/06-two-workers-worker-2.png)
+
+### 6. Stale-worker ownership guard
+
+`npm run verify:guard` (deterministic, in-repo) performs **10 checks**:
+
+1. attempt 1 is claimed → `processing`, `attempts=1`;
+2. the stuck job is recovered by the sweeper → `pending`;
+3. recovery does **not** increment attempts (still 1);
+4. worker B re-claims it → `processing`, `attempts=2`;
+5. stale worker A (attempt 1) **cannot** mark success;
+6. stale worker A (attempt 1) **cannot** record a failure;
+7. the row stays `processing`, `attempts=2` after stale attempts;
+8. no `job_results` row is written by the stale worker;
+9. the current worker (attempt 2) can complete the job;
+10. the authoritative stored result comes from the current worker (attempt 2).
+
+Observed result: **10/10 PASS** during final testing.
+
+> No screenshot is committed for this test — it is a fully automated check
+> (`npm run build`, then `npm run verify:guard`) whose output is the pass/fail report.
+
+### 7. Real DeepSeek background processing (live)
+
+Job: `e49079f8-0adb-4e46-8359-ea3a58d6f785`
+
+Observed:
+- DeepSeek was called by the **worker**, not the HTTP request handler.
+- Model: `deepseek-flash`.
+- Provider request duration: approximately **5199 ms**.
+- The job succeeded on attempt **1**.
+- Exactly **one** durable `job_results` row existed for the job.
+- The structured result passed local (Zod) validation.
+- The returned `quote` was verified as an exact substring of the original review.
+
+Stored result:
+
+```json
+{
+  "quote": "The earbuds are comfortable too, but the microphone sounds muffled during calls and the charging case feels a little cheap.",
+  "rating": 3,
+  "themes": ["sound quality", "battery life", "comfort", "microphone", "charging case"],
+  "sentiment": "mixed",
+  "complaints": ["microphone sounds muffled during calls", "charging case feels a little cheap"]
+}
+```
+
+> No screenshot is committed for this test; the evidence is the worker log
+> (`deepseek request started/succeeded`, `durationMs=5199`) plus the single durable
+> `job_results` row confirmed in the database.
+
+### 8. Fifty-job concurrency-cap test
+
+Observed:
+- 50 jobs were enqueued **before** the worker was started.
+- All 50 were initially `pending`.
+- The test jobs were stored with **`maxAttempts=1`** (each executes at most once).
+- The worker ran with `WORKER_CONCURRENCY=3`.
+- The worker log repeatedly showed `active=1/3`, `active=2/3`, `active=3/3`.
+- The active count **never exceeded 3**.
+- `testProcessingDelayMs=2500` kept each job in `processing` long enough for the concurrent
+  count to be observable.
+- `testFailureMode=always` caused a controlled local failure on every run.
+- Because the forced failure happens **before** the DeepSeek call, this test made
+  **zero DeepSeek API requests**.
+
+Evidence:
+- [View evidence — 50-job concurrency cap](evidence/11-50-job-concurrency-cap.png)
+
+> An earlier, smaller-scale snapshot of the same cap behaviour is also committed:
+> [04-concurrency-cap-preliminary](evidence/04-concurrency-cap-preliminary.png). It is a
+> preliminary concurrency observation, not one of the eight numbered tests above.
+
+## Requirement-to-Evidence Map
+
+| Requirement              | Implementation                                                                                              | Verification                                    | Evidence                                                                        |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------- |
+| Immediate 202 enqueue    | `POST /api/jobs` validates + inserts, returns HTTP 202 (`src/jobs/jobs.routes.ts`)                           | Live via every POST; Tests A–I                  | no dedicated screenshot (all POST live runs)                                    |
+| Idempotency              | DB `UNIQUE(idempotency_key)` + `INSERT ... ON CONFLICT DO NOTHING`                                           | Test 1                                          | [01-idempotency](evidence/01-idempotency.png)                                   |
+| Separate worker          | Independent process (`npm run worker`) polling PostgreSQL; no analysis in the API path                        | Worker logs in Tests B/F/I; live DeepSeek run   | [03-backoff-retries](evidence/03-backoff-retries.png), [11-50-job-concurrency-cap](evidence/11-50-job-concurrency-cap.png) |
+| Concurrency cap          | Per-process `active` set; claims `WORKER_CONCURRENCY - active` per cycle                                      | Test 8                                          | [11-50-job-concurrency-cap](evidence/11-50-job-concurrency-cap.png) (+ [04-concurrency-cap-preliminary](evidence/04-concurrency-cap-preliminary.png)) |
+| Atomic multi-worker claims | Single-statement `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE ... RETURNING`                              | Test 5 (two workers, 6/6 split, no double claim) | [05-two-workers-worker-1](evidence/05-two-workers-worker-1.png), [06-two-workers-worker-2](evidence/06-two-workers-worker-2.png) |
+| Exponential backoff + jitter | `src/worker/retry.ts`: `base·2^(attempt-1)` + bounded jitter `[0, base]`                                 | Test 2 (≈1365/2164/4749/8457 ms)                 | [03-backoff-retries](evidence/03-backoff-retries.png)                           |
+| Dead transition          | `recordJobFailure` → `dead` when `attempts >= max_attempts`; no further retry                                | Tests 2 and 4C                                  | [04-dead-job-no-further-retry](evidence/04-dead-job-no-further-retry.png), [09-dead-letter-view](evidence/09-dead-letter-view.png) |
+| Stuck-job recovery       | Sweeper: `processing` older than `JOB_STUCK_TIMEOUT_MS` → `pending`/`dead`, atomic, attempts untouched        | Test 3 (`136d…e635d`)                            | [05-stuck-before-kill](evidence/05-stuck-before-kill.png), [06-stuck-after-kill](evidence/06-stuck-after-kill.png), [07-stuck-recovery](evidence/07-stuck-recovery.png), [08-stuck-recovery-completed](evidence/08-stuck-recovery-completed.png) |
+| Crash/side-effect idempotence | Guarded success `UPDATE` + `job_results` insert in one transaction; `UNIQUE(job_id)`; stale writes blocked | Test 3 (attempts=2) + verify:guard check 8       | [08-stuck-recovery-completed](evidence/08-stuck-recovery-completed.png); `npm run verify:guard` |
+| Stale-worker protection  | Completion/failure gated by `status='processing' AND attempts=$attempt`                                      | `npm run verify:guard` (10/10)                   | none committed (automated check)                                                |
+| Dead-letter visibility   | `GET /api/jobs/dead` + `GET /dead-jobs` page (payload, attempts/max, error, timestamps)                       | Test 4C                                         | [09-dead-letter-view](evidence/09-dead-letter-view.png)                          |
+| Manual retry             | `POST /api/jobs/:id/retry` atomic `WHERE status='dead'`; same id, fresh budget, payload/key preserved        | Test 4D/E                                       | [10-manual-retry-reset](evidence/10-manual-retry-reset.png)                      |
+| Real AI processing       | Worker → DeepSeek via openai SDK (`deepseek-flash`, `maxRetries: 0`)                                         | Live test (`e490…)`, attempt 1, ≈5199 ms         | none committed (worker log + DB row)                                             |
+| Structured result validation | Zod schema (`sentiment/rating/themes/complaints/quote`) + verbatim quote check                            | Live test result passed local validation         | none committed (stored result shown in Section 7 above)                          |
+
+## Defence Notes
+
+1. **How do two workers avoid claiming the same job?** Claiming is a single atomic SQL
+   statement: `WITH candidates AS (SELECT id ... WHERE status='pending' AND run_at<=now()
+   ORDER BY run_at, id LIMIT $n FOR UPDATE SKIP LOCKED) UPDATE jobs SET status='processing',
+   started_at=now(), attempts=attempts+1 FROM candidates ... RETURNING ...`. The row lock and
+   the `pending → processing` transition happen in the same statement, so there is no window
+   in which another worker can still see the row as eligible; `SKIP LOCKED` makes a second
+   worker skip rows a first worker already locked instead of blocking on them.
+
+2. **What happens if a worker crashes after the side effect but before marking the job
+   complete?** The side effect's output is only persisted by a worker that still owns the
+   attempt: the guarded success `UPDATE ... WHERE status='processing' AND attempts=$attempt`
+   is the ownership test, and the `job_results` insert runs in the same transaction and only
+   when that update matched. If a worker crashes before completing, nothing authoritative is
+   written; the stuck-job sweeper returns the job to `pending` (without incrementing
+   `attempts`), a newer worker re-claims it as the next attempt and runs the work again
+   (at-least-once), and the transactional write plus `UNIQUE(job_id)` guarantee at most one
+   authoritative result row exists. A stale worker can never write a result for a job it no
+   longer owns.
+
+3. **Why is jitter added to exponential backoff, and where is it implemented?** Without
+   jitter, many jobs failing at the same instant would retry in lockstep and hammer the
+   queue/downstream systems in a "thundering herd". Jitter spreads the retries. It is
+   implemented in `src/worker/retry.ts` (`computeRetryDelay`): a random whole number in
+   `[0, JOB_BASE_DELAY_MS]` is added to the exponential component `JOB_BASE_DELAY_MS·2^(attempt-1)`
+   (capped at `2^31-1` ms), and `run_at = now + delay`.
+
+4. **What happens if a job remains `processing` longer than the configured stuck timeout?**
+   Once per poll cycle each worker runs the sweeper, which selects `processing` rows with
+   `started_at < now() - JOB_STUCK_TIMEOUT_MS`, locks them atomically
+   (`FOR UPDATE SKIP LOCKED`), and transitions them in one statement: if
+   `attempts < max_attempts` the job returns to `pending` (`run_at = now()`, `started_at`/
+   `finished_at` cleared, `attempts` **not** incremented, `last_error` set to
+   `Recovered after worker timeout`), becoming immediately eligible for re-claim; if
+   `attempts >= max_attempts` the job becomes `dead` with `finished_at = now()` and cannot run
+   again automatically. Caveat: the sweep runs only while at least one worker is alive.
+
+5. **About the `failed` status.** Retryable attempt failures are **not** persisted as
+   `failed` — the worker returns the job to **`pending`** with a future `run_at`, so `failed`
+   never becomes a resting state. `dead` is the terminal, exhausted state. `failed` remains in
+   the schema/status vocabulary (it is a CHECK-constraint value) but the current worker does
+   not use it as a resting state.
