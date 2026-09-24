@@ -1,8 +1,14 @@
 import { config } from '../config/env';
 import { ApiError } from '../http/errors';
 
-import { JobApi, toApiJob } from './job.model';
-import { findJobById, findJobByIdempotencyKey, insertJob } from './jobs.repository';
+import { DeadJobApi, JobApi, toApiJob, toDeadJobApi } from './job.model';
+import {
+  findJobById,
+  findJobByIdempotencyKey,
+  insertJob,
+  listDeadJobs,
+  resetDeadJobToPending,
+} from './jobs.repository';
 
 export interface EnqueuedJob {
   job: JobApi;
@@ -40,4 +46,22 @@ export async function getJobById(id: string): Promise<JobApi> {
     throw new ApiError(404, 'Job not found');
   }
   return toApiJob(row);
+}
+
+export async function getDeadJobs(): Promise<DeadJobApi[]> {
+  const rows = await listDeadJobs();
+  return rows.map(toDeadJobApi);
+}
+
+export async function retryDeadJob(id: string): Promise<JobApi> {
+  const retried = await resetDeadJobToPending(id);
+  if (retried) {
+    return toApiJob(retried);
+  }
+
+  const existing = await findJobById(id);
+  if (!existing) {
+    throw new ApiError(404, 'Job not found');
+  }
+  throw new ApiError(409, 'Job is not dead and cannot be manually retried');
 }

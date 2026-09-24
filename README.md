@@ -6,14 +6,13 @@ A client submits customer-review text to an API. The API records the work as a *
 and responds immediately; the AI analysis itself runs later, out of band, in a separate
 worker process.
 
-> **Phase 5 status:** workers now run a **stuck-job recovery sweep**. A job left in
-> `processing` by a crashed worker is detected once its `started_at` is older than
-> `JOB_STUCK_TIMEOUT_MS` and recovered — returned to `pending` (attempts intact) when it
-> still has retry budget, or moved to `dead` when exhausted. Completion/failure updates
-> carry an **attempt-number ownership guard** so a stale worker can never complete a newer
-> attempt. A controlled `testProcessingDelayMs` hook keeps a job `processing` long enough
-> to demonstrate the crash/recovery lifecycle. Dead-letter view/manual retry and a real AI
-> provider are **not** implemented yet. See
+> **Phase 6 status:** the system now has a **dead-letter view** — `GET /api/jobs/dead`
+> returns only `dead` jobs (newest first) with enough context to understand the failure —
+> and **manual retry** — `POST /api/jobs/:id/retry` atomically returns a `dead` job to
+> `pending` with a fresh retry budget (same job id, payload, idempotency key; `maxAttempts`
+> unchanged). A minimal operational page at `GET /dead-jobs` inspects and retries dead
+> jobs. A real AI provider and authentication are **not** implemented yet. See
+> [Dead-letter view and manual retry](#dead-letter-view-and-manual-retry) and
 > [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
 
 ## Tech stack
@@ -523,8 +522,97 @@ retry behaviour; a real AI provider will replace the simulation later.
 
 - Stuck-job recovery runs only while a worker is alive — if **no** worker runs, nothing
   sweeps and stranded `processing` jobs stay stranded until a worker starts.
-- No dead-letter view or manual retry — a `dead` job stays `dead` until a future phase.
+- The dead-letter page and API have **no authentication** — they are operational/debugging
+  endpoints intended for local or trusted-network use.
+- A manually retried job keeps its **original payload**. If that payload contained
+  `testFailureMode: "always"`, the job simply fails again and returns to `dead` (expected;
+  there is no payload-mutation endpoint by design).
 - No real AI provider — analysis is simulated.
+
+## Dead-letter view and manual retry
+
+### What the dead-letter view is
+
+When a job exhausts its retry budget it becomes `dead`. The dead-letter view surfaces those
+jobs so an operator can inspect exactly what failed and, after deciding it is safe, restart
+the job with a fresh retry budget — without creating a duplicate and without losing the
+original payload or idempotency key.
+
+### `GET /api/jobs/dead`
+
+Returns **only `dead` jobs**, ordered **newest/recently-dead first** (by `finished_at`
+descending). Response shape:
+
+```json
+{
+  "jobs": [
+    {
+      "id": "…",
+      "type": "review_analysis",
+      "payload": { "review": "…" },
+      "status": "dead",
+      "attempts": 5,
+      "maxAttempts": 5,
+      "lastError": "Simulated failure: testFailureMode=always",
+      "idempotencyKey": "…",
+      "createdAt": "…",
+      "runAt": "…",
+      "startedAt": "…",
+      "finishedAt": "…"
+    }
+  ]
+}
+```
+
+The route is registered **before** `GET /api/jobs/:id`, so the literal path `dead` is always
+matched as the collection route and never falls into the `:id` parameter route (the
+`:id` route also rejects non-UUID ids with `400` as a second guard).
+
+### `POST /api/jobs/:id/retry`
+
+Manually restarts a dead job. **Only valid when the job's current status is `dead`.**
+
+Success (job was dead):
+
+- `status` → `pending`, `attempts` → `0`, `run_at` → now, `started_at` → `null`,
+  `finished_at` → `null`, `last_error` → `null`
+- **same row / same job id**, payload kept, idempotency key kept, `max_attempts` unchanged
+- the existing worker naturally picks it up again (the claim query already looks for
+  `pending` jobs with `run_at <= now()`)
+
+Errors:
+
+- `404 Not found` — no job with that id exists
+- `409 Conflict` — the job exists but is not `dead`
+- `400` — the id is not a valid UUID
+
+**Atomicity.** The transition is a single guarded statement — `UPDATE jobs SET ... WHERE
+id = $1 AND status = 'dead'` (with `RETURNING`). There is no read-then-write race: the
+`status = 'dead'` predicate is the whole guard, so two concurrent retries of the same job
+can only succeed once (the first update wins; the second matches zero rows). If the update
+matches nothing, the service then reads the row only to distinguish `404` (no such job)
+from `409` (exists, not dead) — that read is diagnostic, not part of the transition.
+
+**Why `attempts` resets to `0`.** Manual retry is a human explicitly starting a **fresh
+retry budget** after inspecting a dead job. `attempts` is "how many times the job has been
+claimed/started" and the retry budget is `max_attempts`; setting `attempts = 0` means the
+whole budget is available again (the next claim increments it to `1`). The existing
+automatic retry logic is untouched — no `run_at` backoff is involved here, only `run_at =
+now()`.
+
+### `GET /dead-jobs`
+
+A minimal, plain HTML/CSS/JS operational page (no frontend framework). It:
+
+- fetches and displays the dead jobs from `GET /api/jobs/dead`
+- shows job id, type, payload (pretty-printed JSON), attempts/maxAttempts, last error,
+  and the timestamps (created/run/started/finished)
+- renders a **Retry** button per job that calls `POST /api/jobs/:id/retry`
+- shows a clear success/error message and refreshes the list (the retried job disappears
+  from the dead list)
+
+It is served by the API itself from a compiled module (`src/http/deadJobsPage.ts`) — no
+separate static-file pipeline or frontend build was introduced.
 
 ## Job record design
 
@@ -641,12 +729,13 @@ background-job-system/
 │   ├── app.ts            # Express app: middleware, routes, JSON error handler
 │   ├── server.ts         # Bootstraps the app, listens on PORT
 │   ├── http/
-│   │   └── errors.ts     # Shared ApiError type + UUID helpers
+│   │   ├── errors.ts        # Shared ApiError type + UUID helpers
+│   │   └── deadJobsPage.ts  # Plain-HTML dead-letter view served at /dead-jobs
 │   ├── jobs/
-│   │   ├── job.model.ts      # DB row → API response shape
-│   │   ├── jobs.routes.ts    # POST /api/jobs, GET /api/jobs/:id
+│   │   ├── job.model.ts      # DB row → API response shape (+ dead-job shape)
+│   │   ├── jobs.routes.ts    # POST /api/jobs, GET /api/jobs/dead, GET /api/jobs/:id, POST /api/jobs/:id/retry
 │   │   ├── jobs.schema.ts    # zod validation for job creation
-│   │   ├── jobs.service.ts   # enqueue + fetch logic (idempotency handling)
+│   │   ├── jobs.service.ts   # enqueue, fetch, dead-list + manual-retry logic
 │   │   └── jobs.repository.ts# Parameterized SQL queries against the jobs table
 │   ├── config/
 │   │   ├── env.ts        # Loads/validates environment config
@@ -749,15 +838,29 @@ background-job-system/
 - **`scripts/verify-stale-guard.js`** (`npm run verify:guard`) — an automated controlled
   demo that a recovered-and-reclaimed job ignores a stale worker's completion/failure.
 
+### Phase 6 — dead-letter view and manual retry
+
+- **`GET /api/jobs/dead`** — lists only `dead` jobs, newest-recently-dead first, with
+  `payload`, `attempts`/`maxAttempts`, `lastError`, and timestamps. Registered before
+  `GET /api/jobs/:id` so `dead` is never parsed as a job id.
+- **`POST /api/jobs/:id/retry`** — atomically restarts a `dead` job: `pending`, `attempts =
+  0`, `run_at = now()`, `started_at`/`finished_at`/`last_error` cleared, same id/payload/
+  idempotency key, `max_attempts` unchanged. `404` when missing, `409` when not `dead`.
+- **`GET /dead-jobs`** — minimal plain-HTML operational page served by the API: lists dead
+  jobs, shows the failure context, and offers a per-job Retry button (calls the retry API,
+  shows success/error, refreshes the list).
+- **No schema, worker, retry/backoff, or claiming-logic changes** — the worker picks up a
+  manually retried job through the existing `pending` + `run_at <= now()` path.
+
 ## What is intentionally NOT implemented yet
 
-- **Dead-letter view / manual retry** — a `dead` job stays `dead` until a future phase.
 - **AI / real review-analysis integration** (analysis is still a deterministic simulation).
-- Authentication, React frontend, Redis/BullMQ queues, Docker.
+- Authentication, job-edit/payload-mutation endpoints (a retried job keeps its payload),
+  React frontend, Redis/BullMQ queues, Docker.
 
 These are deliberately deferred to later phases.
 
-## Manual verification (Tests A–G)
+## Manual verification (Tests A–H)
 
 Prerequisites: API running (`npm start`) and worker running (`npm run worker:start`) in two
 separate terminals, using the default `JOB_MAX_ATTEMPTS = 5` and `JOB_BASE_DELAY_MS = 1000`.
@@ -948,3 +1051,70 @@ Checks in order: claim → processing/attempts=1 → backdate started_at → rec
 returns `false` → stale failure records `not_owned` → row still processing/attempts=2 and
 no `job_results` → `completeJobSucceeded(id, attempt=2)` returns `true` → result row exists
 with origin `worker-B`. The job row is cleaned up afterwards.
+
+### Test H — dead-letter view + manual retry (Phase 6)
+
+Prerequisites: API and worker running (`npm start`, `npm run worker:start`) with the
+default `JOB_MAX_ATTEMPTS = 5` (so the job dies in roughly 1+2+4+8 s of backoff plus worker
+delays ≈ 30 s).
+
+**A. Create a job that will definitely die** — `testFailureMode: "always"` makes every
+attempt fail until the budget is exhausted:
+
+```powershell
+$body = @{
+  review          = 'Dead-letter view demo.';
+  idempotencyKey  = 'dead-letter-demo';
+  testFailureMode = 'always'
+} | ConvertTo-Json -Compress
+$r = Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/jobs -ContentType 'application/json' -Body $body
+$r | ConvertTo-Json -Depth 5   # note $r.job.id (or $r.duplicate)
+```
+
+**B. Let it exhaust retries and become `dead`** — poll until `status = "dead"`:
+
+```powershell
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+# Expected end state: status="dead", attempts=5, lastError="Simulated failure: testFailureMode=always"
+```
+
+**C. Open the dead-letter view** — browse to <http://localhost:3000/dead-jobs> (or query the
+API directly):
+
+```powershell
+Invoke-RestMethod -Uri http://localhost:3000/api/jobs/dead | ConvertTo-Json -Depth 6
+# The dead job is listed with its payload, attempts=5 / maxAttempts=5, lastError, and timestamps.
+```
+
+Confirm on the page that the payload, error, and attempts/maxAttempts are visible for that
+job id.
+
+**D. Manually retry it** (click **Retry** on the page, or call the endpoint):
+
+```powershell
+Invoke-RestMethod -Method Post -Uri ("http://localhost:3000/api/jobs/" + $r.job.id + "/retry") | ConvertTo-Json -Depth 5
+```
+
+**E. Confirm the same job is `pending` with a fresh budget:**
+
+```powershell
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+# Same id, status="pending", attempts=0, maxAttempts=5, lastError=null. The job is gone from /api/jobs/dead.
+```
+
+**F. It will fail again — expected.** The original payload (including
+`testFailureMode: "always"`) is preserved, so after the worker picks it up it burns the new
+budget and returns to `dead`:
+
+```powershell
+# wait ~30 s, then:
+Invoke-RestMethod -Uri ("http://localhost:3000/api/jobs/" + $r.job.id) | ConvertTo-Json -Depth 5
+# status="dead" again, attempts=5 — proving the payload drives the (re)behaviour.
+```
+
+**Is there a safe way to make a retried dead job succeed?** There is **no** payload-mutation
+or "toggle failure" endpoint by design — a manual retry re-runs the exact original payload,
+so a payload that always fails (or an environment that still causes the original failure)
+will fail again. That is the intended, honest behaviour. To observe a successful post-retry
+run you would retry a job whose failure cause is transient or environmental (e.g. it died
+temporarily for reasons unrelated to the payload) — no extra endpoints were added for this.

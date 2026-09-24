@@ -2,6 +2,7 @@ import express from 'express';
 import { ZodError } from 'zod';
 
 import { ApiError } from './http/errors';
+import { renderDeadJobsPage } from './http/deadJobsPage';
 import { jobsRouter } from './jobs/jobs.routes';
 
 const SYNTAX_ERROR_MESSAGE = 'Request body is not valid JSON';
@@ -18,6 +19,10 @@ export function createApp(): express.Express {
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
     });
+  });
+
+  app.get('/dead-jobs', (_req, res) => {
+    res.type('html').send(renderDeadJobsPage());
   });
 
   app.use('/api/jobs', jobsRouter);

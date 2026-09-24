@@ -58,3 +58,29 @@ export async function findJobByIdempotencyKey(
   );
   return result.rows[0] ?? null;
 }
+
+export async function listDeadJobs(): Promise<JobRow[]> {
+  const result = await pool.query<JobRow>(
+    `SELECT ${JOB_SELECT_COLUMNS}
+     FROM jobs
+     WHERE status = 'dead'
+     ORDER BY COALESCE(finished_at, updated_at) DESC, id ASC`
+  );
+  return result.rows;
+}
+
+export async function resetDeadJobToPending(id: string): Promise<JobRow | null> {
+  const result = await pool.query<JobRow>(
+    `UPDATE jobs
+     SET status = 'pending',
+         attempts = 0,
+         run_at = now(),
+         started_at = NULL,
+         finished_at = NULL,
+         last_error = NULL
+     WHERE id = $1 AND status = 'dead'
+     RETURNING ${JOB_SELECT_COLUMNS}`,
+    [id]
+  );
+  return result.rows[0] ?? null;
+}

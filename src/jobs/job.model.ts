@@ -28,6 +28,10 @@ export interface JobApi {
   finishedAt: string | null;
 }
 
+export interface DeadJobApi extends JobApi {
+  payload: Record<string, unknown>;
+}
+
 function toIso(value: Date | string): string {
   if (value instanceof Date) {
     return value.toISOString();
@@ -48,5 +52,12 @@ export function toApiJob(row: JobRow): JobApi {
     runAt: toIso(row.run_at),
     startedAt: row.started_at ? toIso(row.started_at) : null,
     finishedAt: row.finished_at ? toIso(row.finished_at) : null,
+  };
+}
+
+export function toDeadJobApi(row: JobRow): DeadJobApi {
+  return {
+    ...toApiJob(row),
+    payload: row.payload,
   };
 }
