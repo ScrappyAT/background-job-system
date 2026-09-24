@@ -189,6 +189,10 @@ Errors:
 - `400 Bad Request` — the `:id` is not a valid UUID.
 - `404 Not Found` — the UUID is valid but no such job exists.
 
+The response also includes a `result` field: it is `null` until the worker has successfully
+persisted a `job_results` row, after which it contains the durable AI analysis output
+(`sentiment`, `rating`, `themes`, `complaints`, `quote`). Existing job fields are unchanged.
+
 ### Error responses
 
 Errors use a consistent JSON shape:
@@ -643,6 +647,30 @@ A minimal, plain HTML/CSS/JS operational page (no frontend framework). It:
 It is served by the API itself from a compiled module (`src/http/deadJobsPage.ts`) — no
 separate static-file pipeline or frontend build was introduced.
 
+### `GET /demo` — demo/testing UI
+
+A single plain HTML/CSS/JS page (same lightweight approach as `/dead-jobs`, no frontend
+framework) for manually exercising the system:
+
+- a **Customer Review** textarea and an **Idempotency Key** input with a **Generate** button
+  (`crypto.randomUUID()` where supported; a key is auto-generated on page load);
+- **Submit Review** calls the existing `POST /api/jobs` (same request contract; validation
+  and idempotency behaviour come from the backend — resubmitting the same key reuses the
+  existing job);
+- a **Job Status** section driven by `GET /api/jobs/:id` showing the real status fields
+  (id, status, attempts/maxAttempts, runAt, startedAt, finishedAt, lastError, etc.) with a
+  colour-coded status badge (`pending`/`processing`/`succeeded`/`failed`/`dead`);
+- an **AI Analysis Result** section that appears once the job is `succeeded` and the stored
+  `job_results` row is available — it renders the real durable output only
+  (sentiment badge, rating as `n / 5`, themes and complaints as chips, and the quote),
+  never a client-side reconstruction;
+- a **Refresh Status** button, plus automatic polling every 2 s while the job is
+  `pending`/`processing` that stops at a terminal state (plain `setInterval`, no dependency);
+- a link to the dead-letter view at `/dead-jobs`.
+
+It exposes no server secrets: the browser only calls the two public endpoints
+(`POST /api/jobs`, `GET /api/jobs/:id`).
+
 ## Job record design
 
 The `jobs` table is the single source of truth for every unit of work. The worker claims
@@ -763,7 +791,8 @@ background-job-system/
 │   ├── server.ts         # Bootstraps the app, listens on PORT
 │   ├── http/
 │   │   ├── errors.ts        # Shared ApiError type + UUID helpers
-│   │   └── deadJobsPage.ts  # Plain-HTML dead-letter view served at /dead-jobs
+│   │   ├── deadJobsPage.ts  # Plain-HTML dead-letter view served at /dead-jobs
+│   │   └── demoPage.ts      # Plain-HTML demo/testing UI served at /demo
 │   ├── jobs/
 │   │   ├── job.model.ts      # DB row → API response shape (+ dead-job shape)
 │   │   ├── jobs.routes.ts    # POST /api/jobs, GET /api/jobs/dead, GET /api/jobs/:id, POST /api/jobs/:id/retry

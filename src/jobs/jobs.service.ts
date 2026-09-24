@@ -5,6 +5,7 @@ import { DeadJobApi, JobApi, toApiJob, toDeadJobApi } from './job.model';
 import {
   findJobById,
   findJobByIdempotencyKey,
+  findJobResultByJobId,
   insertJob,
   listDeadJobs,
   resetDeadJobToPending,
@@ -45,7 +46,8 @@ export async function getJobById(id: string): Promise<JobApi> {
   if (!row) {
     throw new ApiError(404, 'Job not found');
   }
-  return toApiJob(row);
+  const result = await findJobResultByJobId(id);
+  return toApiJob(row, result);
 }
 
 export async function getDeadJobs(): Promise<DeadJobApi[]> {

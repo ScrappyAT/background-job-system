@@ -49,6 +49,16 @@ export async function findJobById(id: string): Promise<JobRow | null> {
   return result.rows[0] ?? null;
 }
 
+export async function findJobResultByJobId(
+  jobId: string
+): Promise<Record<string, unknown> | null> {
+  const result = await pool.query<{ result: Record<string, unknown> }>(
+    `SELECT result FROM job_results WHERE job_id = $1`,
+    [jobId]
+  );
+  return result.rows[0]?.result ?? null;
+}
+
 export async function findJobByIdempotencyKey(
   idempotencyKey: string
 ): Promise<JobRow | null> {

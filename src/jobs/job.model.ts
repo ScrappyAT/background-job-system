@@ -26,6 +26,7 @@ export interface JobApi {
   runAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  result: Record<string, unknown> | null;
 }
 
 export interface DeadJobApi extends JobApi {
@@ -39,7 +40,10 @@ function toIso(value: Date | string): string {
   return new Date(value).toISOString();
 }
 
-export function toApiJob(row: JobRow): JobApi {
+export function toApiJob(
+  row: JobRow,
+  result: Record<string, unknown> | null = null
+): JobApi {
   return {
     id: row.id,
     type: row.type,
@@ -52,6 +56,7 @@ export function toApiJob(row: JobRow): JobApi {
     runAt: toIso(row.run_at),
     startedAt: row.started_at ? toIso(row.started_at) : null,
     finishedAt: row.finished_at ? toIso(row.finished_at) : null,
+    result,
   };
 }
 
