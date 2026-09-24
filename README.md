@@ -6,9 +6,9 @@ A client submits customer-review text to an API. The API records the work as a *
 and responds immediately; the AI analysis itself runs later, out of band, in a separate
 worker process.
 
-> **Phase 1 status:** this repository currently scaffolds the application and defines the
-> job record. The job-enqueue API endpoint and the background worker are **not** implemented
-> yet. See [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
+> **Phase 2 status:** jobs can now be enqueued (`POST /api/jobs`) and their status retrieved
+> (`GET /api/jobs/:id`). There is **no background worker yet**, so enqueued jobs remain
+> `pending` until a later phase. See [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
 
 ## Tech stack
 
@@ -44,6 +44,149 @@ The API records the intent as a job row and answers immediately. A worker later 
 job up, does the slow analysis, and updates the job's status. The client can poll for the
 result. This keeps the API fast and resilient, and lets multiple analyses progress
 concurrently.
+
+## REST API
+
+All endpoints return JSON. The API endpoints documented here are the HTTP side of the job
+system; **no worker exists yet**, so jobs stay in `pending` until a later phase.
+
+### `POST /api/jobs` — enqueue a review-analysis job
+
+Accepts a review-analysis job and returns immediately without performing any analysis.
+
+Request body:
+
+```json
+{
+  "review": "The battery life is great but the earbuds are uncomfortable.",
+  "idempotencyKey": "review-001"
+}
+```
+
+Validation:
+
+- `review` — required, must be a non-empty string after trimming.
+- `idempotencyKey` — required, must be a non-empty string after trimming.
+
+Both values are trimmed before being stored. Every submitted job is created with
+`type = "review_analysis"`; clients cannot choose an arbitrary job type.
+
+Success response — HTTP `202 Accepted` (the job was accepted for later processing):
+
+```json
+{
+  "duplicate": false,
+  "job": {
+    "id": "3467d3f0-a325-44aa-874d-49209a433ea0",
+    "type": "review_analysis",
+    "status": "pending",
+    "attempts": 0,
+    "maxAttempts": 5,
+    "lastError": null,
+    "idempotencyKey": "review-001",
+    "createdAt": "2026-09-24T09:34:48.715Z",
+    "startedAt": null,
+    "finishedAt": null
+  }
+}
+```
+
+> **Why HTTP 202?** The endpoint does not do the work — it only persists the job and
+> returns. 202 (Accepted) is the status code for exactly this: the request has been
+> accepted for processing later. It is not 201 (Created) because the "resource" a client
+> ultimately wants (the analysis result) does not exist yet.
+
+### Idempotency key
+
+`idempotencyKey` guarantees the same logical submission is never enqueued twice. The
+`jobs.idempotency_key` column has a database-level `UNIQUE` constraint, and the insert is
+performed with `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` — so the database is
+the final authority, not an application-level "select then insert" check. This stays safe
+even when two requests with the same key arrive at nearly the same time.
+
+If the key already exists:
+
+- no second job is created;
+- the **existing** job is returned unchanged (its status, attempts, `run_at`, payload, and
+  timestamps are not touched);
+- the response is still HTTP 202 (it represents the same previously accepted job) with
+  `"duplicate": true` and the original job's `id`.
+
+Submitting the same idempotency key twice therefore returns the same job ID both times.
+Example duplicate response (note the same `id`, and `"duplicate": true`):
+
+```json
+{
+  "duplicate": true,
+  "job": {
+    "id": "3467d3f0-a325-44aa-874d-49209a433ea0",
+    "type": "review_analysis",
+    "status": "pending",
+    "attempts": 0,
+    "maxAttempts": 5,
+    "lastError": null,
+    "idempotencyKey": "review-001",
+    "createdAt": "2026-09-24T09:34:48.715Z",
+    "startedAt": null,
+    "finishedAt": null
+  }
+}
+```
+
+### `GET /api/jobs/:id` — get a job's status
+
+Returns the current state of a job by its UUID.
+
+```powershell
+Invoke-RestMethod -Uri http://localhost:3000/api/jobs/3467d3f0-a325-44aa-874d-49209a433ea0
+```
+
+Success response — HTTP 200:
+
+```json
+{
+  "job": {
+    "id": "3467d3f0-a325-44aa-874d-49209a433ea0",
+    "type": "review_analysis",
+    "status": "pending",
+    "attempts": 0,
+    "maxAttempts": 5,
+    "lastError": null,
+    "idempotencyKey": "review-001",
+    "createdAt": "2026-09-24T09:34:48.715Z",
+    "startedAt": null,
+    "finishedAt": null
+  }
+}
+```
+
+Errors:
+
+- `400 Bad Request` — the `:id` is not a valid UUID.
+- `404 Not Found` — the UUID is valid but no such job exists.
+
+### Error responses
+
+Errors use a consistent JSON shape:
+
+```json
+{
+  "error": {
+    "status": 422,
+    "message": "Validation failed",
+    "details": [
+      { "field": "review", "message": "..." }
+    ]
+  }
+}
+```
+
+| Status | When                                                                                                 |
+| ------ | ---------------------------------------------------------------------------------------------------- |
+| `400`  | Malformed job id, or the request body is not valid JSON.                                             |
+| `404`  | A valid UUID was supplied but no job with that id exists.                                            |
+| `422`  | Request body failed validation (e.g. missing or blank `review` / `idempotencyKey`).                  |
+| `500`  | An unexpected server or database error. The client only ever sees a generic message (never stack traces or connection details). |
 
 ## Job record design
 
@@ -153,8 +296,16 @@ background-job-system/
 ├── package.json          # Scripts and dependencies
 ├── tsconfig.json         # TypeScript configuration
 ├── src/
-│   ├── app.ts            # Express app: middleware + GET /health
+│   ├── app.ts            # Express app: middleware, routes, JSON error handler
 │   ├── server.ts         # Bootstraps the app, listens on PORT
+│   ├── http/
+│   │   └── errors.ts     # Shared ApiError type + UUID helpers
+│   ├── jobs/
+│   │   ├── job.model.ts      # DB row → API response shape
+│   │   ├── jobs.routes.ts    # POST /api/jobs, GET /api/jobs/:id
+│   │   ├── jobs.schema.ts    # zod validation for job creation
+│   │   ├── jobs.service.ts   # enqueue + fetch logic (idempotency handling)
+│   │   └── jobs.repository.ts# Parameterized SQL queries against the jobs table
 │   ├── config/
 │   │   ├── env.ts        # Loads/validates environment config
 │   │   └── database.ts   # pg connection pool built from DATABASE_URL
@@ -164,7 +315,9 @@ background-job-system/
 │           └── run.ts                # Migration runner (ordered, tracked, transactional)
 ```
 
-## What is implemented in Phase 1
+## What is implemented so far
+
+### Phase 1 — scaffold and job record
 
 - Node.js + TypeScript + Express + PostgreSQL (+ pg + dotenv) scaffold.
 - `tsconfig.json` for a Node.js/Express TypeScript project.
@@ -181,10 +334,24 @@ background-job-system/
 - `GET /health` returning JSON confirming the API is running.
 - `README.md` documenting the system.
 
+### Phase 2 — job enqueue + status endpoint
+
+- `POST /api/jobs` accepting review-analysis jobs (zod validation, no client-chosen job
+  type, stored payload contains the review text).
+- Race-safe idempotency via the database `UNIQUE` constraint plus
+  `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`, returning the existing job on a
+  duplicate.
+- `GET /api/jobs/:id` returning a job's status (`400` for a malformed UUID, `404` when no
+  such job exists).
+- Consistent JSON error responses (`400`, `404`, `422`, `500`), with a centralized error
+  handler that never leaks internal details.
+- Service/repository layering keeps SQL and route handlers small and uses parameterized
+  queries throughout.
+
 ## What is intentionally NOT implemented yet
 
-- The **job enqueue API** endpoint (the client-facing "create a job" route).
-- The **background worker** (claiming, executing, and finishing jobs).
+- The **background worker** (claiming, executing, and finishing jobs). Until it exists,
+  enqueued jobs remain `pending`.
 - Job **retries**, **backoff scheduling**, and **dead-letter** handling to `dead`.
 - **AI / review-analysis integration** (any work the job actually performs).
 - Authentication, React frontend, Redis/BullMQ queues, Docker.
