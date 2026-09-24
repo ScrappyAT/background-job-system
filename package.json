@@ -7,6 +7,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc && node -e \"require('fs').cpSync('src/db/migrations','dist/db/migrations',{recursive:true,filter:(s)=>require('fs').statSync(s).isDirectory()||s.endsWith('.sql')})\"",
     "start": "node dist/server.js",
+    "worker": "tsx src/worker/worker.ts",
+    "worker:start": "node dist/worker/worker.js",
     "db:migrate": "tsx src/db/migrations/run.ts"
   },
   "keywords": [

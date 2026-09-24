@@ -6,9 +6,11 @@ A client submits customer-review text to an API. The API records the work as a *
 and responds immediately; the AI analysis itself runs later, out of band, in a separate
 worker process.
 
-> **Phase 2 status:** jobs can now be enqueued (`POST /api/jobs`) and their status retrieved
-> (`GET /api/jobs/:id`). There is **no background worker yet**, so enqueued jobs remain
-> `pending` until a later phase. See [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
+> **Phase 3 status:** a separate background **worker** process now claims and completes
+> jobs, using an atomic PostgreSQL claim. Jobs are enqueued by the API
+> (`POST /api/jobs`) and status read via `GET /api/jobs/:id`. Retry/backoff, stuck-job
+> recovery, dead-letter handling, and a real AI provider are **not** implemented yet.
+> See [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
 
 ## Tech stack
 
@@ -47,8 +49,9 @@ concurrently.
 
 ## REST API
 
-All endpoints return JSON. The API endpoints documented here are the HTTP side of the job
-system; **no worker exists yet**, so jobs stay in `pending` until a later phase.
+All endpoints return JSON. The API only persists and inspects jobs — **it never does the
+work**. A separate worker process (see [Worker (background processing)](#worker-background-processing))
+claims and runs jobs. While no worker is running, submitted jobs simply stay `pending`.
 
 ### `POST /api/jobs` — enqueue a review-analysis job
 
@@ -188,6 +191,142 @@ Errors use a consistent JSON shape:
 | `422`  | Request body failed validation (e.g. missing or blank `review` / `idempotencyKey`).                  |
 | `500`  | An unexpected server or database error. The client only ever sees a generic message (never stack traces or connection details). |
 
+## Worker (background processing)
+
+### API process vs worker process
+
+- **API** (`npm start`, `npm run dev`) — serves HTTP: enqueues jobs and reports their
+  status. It performs no analysis itself.
+- **Worker** (`npm run worker`, `npm run worker:start`) — a long-running process that polls
+  the database, claims eligible jobs, runs the review-analysis handler, and records the
+  outcome. The API never starts the worker automatically.
+
+Run each in a separate terminal:
+
+```powershell
+# Terminal 1 — API
+npm run dev          # or: npm run build; npm start
+
+# Terminal 2 — worker (same project, separate console)
+npm run worker       # or: npm run build; npm run worker:start
+```
+
+### How the worker finds work
+
+Every `WORKER_POLL_INTERVAL_MS` (default `1000` ms) the worker claims up to
+**`WORKER_CONCURRENCY - active`** eligible jobs and processes them concurrently. A job is
+eligible when `status = 'pending' AND run_at <= now()`.
+
+### Atomic claiming (and why it is safe)
+
+Claiming is **one PostgreSQL statement**, not a "select then update". When the worker wants
+up to N jobs it runs (simplified):
+
+```sql
+WITH candidates AS (
+  SELECT id
+  FROM jobs
+  WHERE status = 'pending' AND run_at <= now()
+  ORDER BY run_at, id
+  LIMIT $N
+  FOR UPDATE SKIP LOCKED          -- lock these rows, skip rows another worker locked
+)
+UPDATE jobs j
+SET status = 'processing', started_at = now(), attempts = j.attempts + 1
+FROM candidates c
+WHERE j.id = c.id
+RETURNING ...;                    -- hands the claimed rows back to this worker
+```
+
+Why this is safe:
+
+- **`FOR UPDATE`** places a row lock on every selected candidate. Any other transaction
+  that tries to touch those rows (including another worker's claim) must wait until the
+  lock is released at commit.
+- **`SKIP LOCKED`** turns that blocking behaviour into "skip": rows already locked by
+  another worker are skipped, so two workers never block each other — each grabs rows the
+  other has not yet locked.
+- Because the `SELECT ... FOR UPDATE` and the `UPDATE` are a **single atomic statement**,
+  there is no window in which another worker can see the row as `pending` and claim it
+  too. The row moves from `pending` to `processing` in the same instant it is locked.
+- **Why `SELECT`-then-`UPDATE` would be unsafe:** with two separate queries, both workers
+  could run the `SELECT`, see the same `pending` job, and then both execute the `UPDATE`.
+  Nothing stops the second `UPDATE` from succeeding, so one job could be claimed (and
+  processed) twice. The single-statement lock+update removes that window entirely.
+
+The result: two (or more) workers running at the same time never claim the same job. Each
+row is claimed by exactly one worker.
+
+### Concurrency cap
+
+`WORKER_CONCURRENCY` limits simultaneous jobs **within a single worker process**. The worker
+tracks `active` jobs in memory and only ever claims `WORKER_CONCURRENCY - active` more, so
+its in-process count never exceeds the configured value. Each running worker process starts
+its own in-memory counter — the cap is per process by design.
+
+### Simulated review-analysis handler
+
+There is **no AI provider** yet. `review_analysis` jobs are handled by a deterministic
+simulation that:
+
+1. reads the `review` from the job payload;
+2. waits `WORKER_TASK_DELAY_MS` (default `2500` ms ≈ 2–3 s) to mimic real analysis work;
+3. returns a result derived purely from the review text, e.g.:
+
+```json
+{
+  "review": "The battery life is great but the earbuds are uncomfortable.",
+  "processed": true,
+  "summary": "Simulated review analysis completed",
+  "reviewFingerprint": "9cf9d5a7"
+}
+```
+
+`reviewFingerprint` is a deterministic hash of the review, so the same review always
+produces the same result. Unknown job types are marked `failed` with a recorded error.
+
+### Successful completion and durable results
+
+On success the worker atomically (in one transaction):
+
+1. sets the job to `succeeded`, `finished_at = now()`, and clears `last_error`;
+2. writes the result to the **`job_results`** table (new migration `002`):
+
+| Column       | Type          | Notes                                              |
+| ------------ | ------------- | -------------------------------------------------- |
+| `id`         | `uuid`        | Primary key (database-generated).                  |
+| `job_id`     | `uuid`        | **`UNIQUE`, FK → `jobs(id)`**; one row per job.    |
+| `result`     | `jsonb`       | The handler's output.                              |
+| `created_at` | `timestamptz` | When the result row was created.                   |
+
+`job_id` is `UNIQUE` and the insert is `INSERT ... ON CONFLICT (job_id) DO NOTHING`, so a
+job can never produce a second result row even if it were somehow run more than once —
+durable output is idempotent at the database level.
+
+### Attempts semantics
+
+`attempts` means **"how many times the job has been claimed/started by a worker"**. The
+claim statement increments `attempts` atomically when a job is picked up. It is **not**
+incremented again on success: a successful job's `attempts` reflects every execution that
+occurred, including the final successful one. If an execution fails, the attempt that just
+failed is already counted by the claim increment; retry scheduling (future phase) will use
+`attempts` vs `max_attempts` to decide whether to retry or mark the job `dead`.
+
+### Temporary failure behaviour (this phase)
+
+If the handler throws (handled exception), the worker marks the job `failed` and stores the
+message in `last_error` so it can be diagnosed. **No retry/backoff exists yet** — the job
+simply stays `failed`. A hard kill of a worker (e.g. closing the terminal abruptly) can
+leave an in-progress job in `processing`; that is **expected** for now and is exactly what
+the future stuck-job recovery phase will address.
+
+### Current limitations
+
+- No retry scheduling, backoff, or jitter.
+- No stuck-job recovery (`processing` jobs abandoned by a dead worker stay `processing`).
+- No dead-letter view or manual retry (and no transition to `dead`).
+- No real AI provider — analysis is simulated.
+
 ## Job record design
 
 The `jobs` table is the single source of truth for every unit of work. The worker claims
@@ -202,12 +341,12 @@ store, the table is durable and queryable — no separate queue needed for this 
 | `type`           | `text`        | Yes      | Kind of work; the initial type is `review_analysis`.                                  |
 | `payload`        | `jsonb`       | Yes      | The job's input, e.g. the customer-review text.                                       |
 | `status`         | `text`        | Yes      | Lifecycle state; constrained to the five values below.                                |
-| `attempts`       | `integer`     | Yes      | How many times the job has been attempted; starts at 0.                               |
+| `attempts`       | `integer`     | Yes      | Number of times the job has been claimed/started; incremented atomically on claim.   |
 | `max_attempts`   | `integer`     | Yes      | Cap on attempts, copied from configuration when the job is created.                   |
 | `last_error`     | `text`        | No       | Error message from the most recent failed attempt, when any.                          |
 | `run_at`         | `timestamptz` | Yes      | When the job becomes eligible to run; supports delayed runs and retry backoff.         |
 | `started_at`     | `timestamptz` | No       | Set when a worker claims the job; used to detect stuck jobs.                           |
-| `finished_at`    | `timestamptz` | No       | Set when the job reaches a terminal state (`succeeded`/`failed`/`dead`).               |
+| `finished_at`    | `timestamptz` | No       | Set when the job reaches a terminal outcome (currently `succeeded`; later also `dead`). |
 | `idempotency_key`| `text`        | Yes      | Unique per job (DB-level UNIQUE) so the same work is never enqueued twice.             |
 | `created_at`     | `timestamptz` | Yes      | When the row was inserted.                                                             |
 | `updated_at`     | `timestamptz` | Yes      | Touched automatically on every update to reflect state changes.                        |
@@ -238,7 +377,7 @@ last allowed attempt.
 - CHECK constraints pin `status` to the five values above, keep `attempts >= 0`,
   `max_attempts >= 1`, and `attempts <= max_attempts`.
 - `idx_jobs_eligible` (`run_at`) filters `pending` jobs with `run_at <= now()` —
-  the exact lookup the worker will use to find work.
+  the exact lookup the worker uses to find work.
 - `idx_jobs_stuck_processing` (`started_at`) filters `processing` jobs that started long
   ago and never finished — the lookup used to detect stuck jobs.
 - A trigger keeps `updated_at` current on every `UPDATE`.
@@ -247,15 +386,16 @@ last allowed attempt.
 
 Copy `.env.example` to `.env` and fill in real values. Never commit `.env`.
 
-| Variable                     | Default   | Purpose                                                    |
-| ---------------------------- | --------- | ---------------------------------------------------------- |
-| `PORT`                       | `3000`    | Port the API listens on.                                   |
-| `DATABASE_URL`               | —         | PostgreSQL connection string (required).                   |
-| `WORKER_CONCURRENCY`         | `3`       | Jobs the future worker processes concurrently.             |
-| `JOB_MAX_ATTEMPTS`           | `5`       | Attempts before a job becomes `dead`.                      |
-| `JOB_BASE_DELAY_MS`          | `1000`    | Base retry-backoff delay; later scaled by attempt number.  |
-| `JOB_STUCK_TIMEOUT_MS`       | `60000`   | When a `processing` job is considered stuck.               |
-| `WORKER_POLL_INTERVAL_MS`    | `1000`    | How often the future worker polls for eligible jobs.       |
+| Variable                     | Default   | Purpose                                                        |
+| ---------------------------- | --------- | -------------------------------------------------------------- |
+| `PORT`                       | `3000`    | Port the API listens on.                                       |
+| `DATABASE_URL`               | —         | PostgreSQL connection string (required).                       |
+| `WORKER_CONCURRENCY`         | `3`       | Max simultaneous jobs a single worker processes.               |
+| `WORKER_POLL_INTERVAL_MS`    | `1000`    | How often the worker polls for eligible jobs.                  |
+| `WORKER_TASK_DELAY_MS`       | `2500`    | Simulated analysis duration (ms) used instead of a real AI call. |
+| `JOB_MAX_ATTEMPTS`           | `5`       | Attempt cap before a job becomes `dead` (future phase).        |
+| `JOB_BASE_DELAY_MS`          | `1000`    | Base retry-backoff delay; used by a future retry phase.        |
+| `JOB_STUCK_TIMEOUT_MS`       | `60000`   | When a `processing` job is considered stuck (future phase).    |
 
 ## Local setup
 
@@ -309,9 +449,14 @@ background-job-system/
 │   ├── config/
 │   │   ├── env.ts        # Loads/validates environment config
 │   │   └── database.ts   # pg connection pool built from DATABASE_URL
+│   ├── worker/
+│   │   ├── worker.ts                # Poll loop, concurrency cap, graceful shutdown
+│   │   ├── job.handlers.ts          # Simulated review-analysis handler (deterministic)
+│   │   └── jobs.worker.repository.ts# Atomic claim + success/failure completion SQL
 │   └── db/
 │       └── migrations/
 │           ├── 001_create_jobs.sql   # Jobs table (checks, indexes, trigger)
+│           ├── 002_create_job_results.sql  # Durable results (UNIQUE job_id)
 │           └── run.ts                # Migration runner (ordered, tracked, transactional)
 ```
 
@@ -348,12 +493,26 @@ background-job-system/
 - Service/repository layering keeps SQL and route handlers small and uses parameterized
   queries throughout.
 
+### Phase 3 — worker: atomic claiming, execution, and durable results
+
+- A standalone **worker** process (`npm run worker`) with its own poll loop, an in-process
+  concurrency cap (`WORKER_CONCURRENCY`), and graceful shutdown on SIGINT/SIGTERM.
+- **Atomic claiming** using `SELECT ... FOR UPDATE SKIP LOCKED` merged with `UPDATE ...
+  FROM` + `RETURNING` in one statement, so no job can be claimed twice even with multiple
+  workers running (verified by running two workers concurrently).
+- `attempts` incremented atomically at claim time.
+- A **simulated review-analysis handler** (deterministic result + `reviewFingerprint`,
+  delay configurable via `WORKER_TASK_DELAY_MS`).
+- Migration `002_create_job_results.sql`: durable `job_results` table with `UNIQUE
+  job_id`, written atomically with the job's success via `INSERT ... ON CONFLICT
+  (job_id) DO NOTHING`.
+- Temporary failure marks a job `failed` with `last_error` (no retries yet).
+
 ## What is intentionally NOT implemented yet
 
-- The **background worker** (claiming, executing, and finishing jobs). Until it exists,
-  enqueued jobs remain `pending`.
 - Job **retries**, **backoff scheduling**, and **dead-letter** handling to `dead`.
-- **AI / review-analysis integration** (any work the job actually performs).
+- **Stuck-job recovery** (a job left in `processing` by a hard-killed worker stays there).
+- **AI / real review-analysis integration** (analysis is still a deterministic simulation).
 - Authentication, React frontend, Redis/BullMQ queues, Docker.
 
 These are deliberately deferred to later phases.

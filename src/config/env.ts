@@ -30,6 +30,7 @@ export const config = {
   jobBaseDelayMs: intFromEnv('JOB_BASE_DELAY_MS', 1000),
   jobStuckTimeoutMs: intFromEnv('JOB_STUCK_TIMEOUT_MS', 60000),
   workerPollIntervalMs: intFromEnv('WORKER_POLL_INTERVAL_MS', 1000),
+  workerTaskDelayMs: intFromEnv('WORKER_TASK_DELAY_MS', 2500),
 } as const;
 
 export type AppConfig = typeof config;
