@@ -8,6 +8,7 @@ import {
   completeJobSucceeded,
   recordJobFailure,
   recoverStuckJobs,
+  releaseUnstartedClaims,
 } from './jobs.worker.repository';
 import { computeRetryDelay } from './retry';
 
@@ -21,6 +22,7 @@ class WorkerProcess {
   private readonly pollIntervalMs = config.workerPollIntervalMs;
   private readonly active = new Set<string>();
   private readonly inFlight = new Set<Promise<void>>();
+  private readonly claimCycles = new Set<Promise<void>>();
   private shuttingDown = false;
 
   start(): void {
@@ -42,6 +44,9 @@ class WorkerProcess {
       `[${this.id}] shutdown requested; waiting for ${this.inFlight.size} in-flight job(s)`
     );
     await Promise.allSettled([...this.inFlight]);
+    while (this.claimCycles.size > 0) {
+      await Promise.allSettled([...this.claimCycles]);
+    }
     await closePool();
     console.log(`[${this.id}] database pool closed; shutdown complete`);
   }
@@ -56,19 +61,12 @@ class WorkerProcess {
           console.error(`[${this.id}] stuck-job sweep failed:`, error);
         }
       }
+      if (this.shuttingDown) {
+        break;
+      }
       const freeSlots = this.concurrency - this.active.size;
       if (freeSlots > 0) {
-        try {
-          const jobs = await claimJobs(freeSlots);
-          for (const job of jobs) {
-            if (this.shuttingDown) {
-              break;
-            }
-            this.dispatch(job);
-          }
-        } catch (error) {
-          console.error(`[${this.id}] claim failed:`, error);
-        }
+        await this.claimAndDispatch(freeSlots);
       }
       if (this.shuttingDown) {
         break;
@@ -76,6 +74,52 @@ class WorkerProcess {
       await sleep(this.pollIntervalMs);
     }
     console.log(`[${this.id}] poll loop stopped`);
+  }
+
+  private claimAndDispatch(freeSlots: number): Promise<void> {
+    const cycle = this.runClaimCycle(freeSlots);
+    this.claimCycles.add(cycle);
+    void cycle.finally(() => this.claimCycles.delete(cycle));
+    return cycle;
+  }
+
+  private async runClaimCycle(freeSlots: number): Promise<void> {
+    let claimed: JobRow[] = [];
+    let dispatched = 0;
+    try {
+      claimed = await claimJobs(freeSlots);
+      for (const job of claimed) {
+        if (this.shuttingDown) {
+          break;
+        }
+        this.dispatch(job);
+        dispatched += 1;
+      }
+    } catch (error) {
+      console.error(`[${this.id}] claim failed:`, error);
+    }
+    const undispatched = claimed.slice(dispatched);
+    if (undispatched.length > 0) {
+      await this.releaseUndispatched(undispatched);
+    }
+  }
+
+  private async releaseUndispatched(undispatched: JobRow[]): Promise<void> {
+    try {
+      const released = await releaseUnstartedClaims(
+        undispatched.map((job) => ({ id: job.id, attempt: job.attempts }))
+      );
+      console.log(
+        `[${this.id}] released ${released} unstarted claim(s) back to pending during shutdown ` +
+          `ids=${undispatched.map((job) => job.id).join(',')}`
+      );
+    } catch (error) {
+      console.error(
+        `[${this.id}] failed to release ${undispatched.length} unstarted claim(s) ` +
+          `(they fall back to stuck-job recovery):`,
+        error
+      );
+    }
   }
 
   private async sweepStuckJobs(): Promise<void> {

@@ -410,6 +410,19 @@ sleeps the override instead of `WORKER_TASK_DELAY_MS`; all other jobs are unaffe
 clean single-recovery demo keep the worker's `JOB_STUCK_TIMEOUT_MS` **larger** than the delay
 (see [Test F](#test-f--crash-recovery-stuck-job-with-stale-worker-evidence)).
 
+### Graceful shutdown (Ctrl+C / SIGTERM)
+
+On SIGINT/SIGTERM the worker stops claiming, waits for the jobs it already **dispatched** to
+finish (unchanged behaviour — their success/failure/retry paths run normally), then closes the
+pool. If shutdown begins while a claim batch is in flight, the claims from that batch that were
+**never dispatched** — `processing` with an incremented `attempts`, but with no handler started —
+are released back to `pending` (`attempts` decremented, `started_at = NULL`, `run_at = now()`) by
+`releaseUnstartedClaims`. The release is guarded by `status = 'processing' AND attempts = <the
+attempt this worker claimed>`, so **no execution attempt is consumed by work that never ran** and
+a stale worker cannot release a job a newer attempt owns. Worker log:
+`released N unstarted claim(s) back to pending during shutdown ids=...`. If the release itself
+fails, those jobs fall back to [stuck-job recovery](#stuck-job-recovery) as before.
+
 ### Review-analysis handler (real DeepSeek API)
 
 `review_analysis` jobs call the **DeepSeek API** (OpenAI-compatible) via the official
@@ -814,7 +827,8 @@ background-job-system/
 │   │       ├── 002_create_job_results.sql  # Durable results (UNIQUE job_id)
 │   │       └── run.ts                # Migration runner (ordered, tracked, transactional)
 ├── scripts/
-│   └── verify-stale-guard.js  # Automated demo: a stale worker cannot complete a newer attempt
+│   ├── verify-stale-guard.js  # Automated demo: a stale worker cannot complete a newer attempt
+│   └── verify-shutdown-release.js # Automated demo: shutdown releases claimed-but-undispatched jobs
 ├── evidence/
 │   └── *.png                  # Committed screenshots/transcripts of manual verification
 ```
@@ -943,7 +957,7 @@ background-job-system/
 
 These are deliberately deferred to later phases.
 
-## Manual verification (Tests A–I)
+## Manual verification (Tests A–J)
 
 Prerequisites: API running (`npm start`) and worker running (`npm run worker:start`) in two
 separate terminals, using the default `JOB_MAX_ATTEMPTS = 5` and `JOB_BASE_DELAY_MS = 1000`.
@@ -1247,6 +1261,23 @@ fails locally (`testFailureMode: always` — thrown **before** the DeepSeek call
 job. Because the forced failure short-circuits before the provider call, this break test
 performs **zero DeepSeek API requests**.
 
+### Test J — automated shutdown claim release (`npm run verify:shutdown`)
+
+Proves a claimed-but-undispatched job goes back to `pending` without burning an attempt, and that
+a wrong attempt value releases nothing. Build first, then run (talks to PostgreSQL directly
+through the built repository; no server or worker needed):
+
+```powershell
+npm run build
+npm run verify:shutdown
+# ALL PASS on success; exits non-zero on failure.
+```
+
+Checks: claim → `processing`/`attempts=1` → release with the correct attempt → 1 row,
+`pending`/`attempts=0`/`started_at=NULL` → a job not passed to the release is untouched → re-claim
+→ `attempts=1` (same number) → release with a wrong attempt → 0 rows, row unchanged → a second
+release of an already-released job → 0 rows, `attempts=0`. Job rows are cleaned up afterwards.
+
 ## Verified Results and Evidence
 
 The results below are what was **actually observed** during manual verification. Each entry
@@ -1422,7 +1453,7 @@ Evidence:
 
 | Requirement              | Implementation                                                                                              | Verification                                    | Evidence                                                                        |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------- |
-| Immediate 202 enqueue    | `POST /api/jobs` validates + inserts, returns HTTP 202 (`src/jobs/jobs.routes.ts`)                           | Live via every POST; Tests A–I                  | no dedicated screenshot (all POST live runs)                                    |
+| Immediate 202 enqueue    | `POST /api/jobs` validates + inserts, returns HTTP 202 (`src/jobs/jobs.routes.ts`)                           | Live via every POST; Tests A–J                  | no dedicated screenshot (all POST live runs)                                    |
 | Idempotency              | DB `UNIQUE(idempotency_key)` + `INSERT ... ON CONFLICT DO NOTHING`                                           | Test 1                                          | [01-idempotency](evidence/01-idempotency.png)                                   |
 | Separate worker          | Independent process (`npm run worker`) polling PostgreSQL; no analysis in the API path                        | Worker logs in Tests B/F/I; live DeepSeek run   | [03-backoff-retries](evidence/03-backoff-retries.png), [11-50-job-concurrency-cap](evidence/11-50-job-concurrency-cap.png) |
 | Concurrency cap          | Per-process `active` set; claims `WORKER_CONCURRENCY - active` per cycle                                      | Test 8                                          | [11-50-job-concurrency-cap](evidence/11-50-job-concurrency-cap.png) (+ [04-concurrency-cap-preliminary](evidence/04-concurrency-cap-preliminary.png)) |
