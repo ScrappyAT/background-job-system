@@ -249,7 +249,7 @@ up to N jobs it runs (simplified):
 
 ```sql
 WITH candidates AS (
-  SELECT id
+  SELECT id, last_error
   FROM jobs
   WHERE status = 'pending' AND run_at <= now()
   ORDER BY run_at, id
@@ -257,11 +257,18 @@ WITH candidates AS (
   FOR UPDATE SKIP LOCKED          -- lock these rows, skip rows another worker locked
 )
 UPDATE jobs j
-SET status = 'processing', started_at = now(), attempts = j.attempts + 1
+SET status = 'processing', started_at = now(), attempts = j.attempts + 1, last_error = NULL
 FROM candidates c
 WHERE j.id = c.id
-RETURNING ...;                    -- hands the claimed rows back to this worker
+RETURNING ..., c.last_error AS previous_last_error;
+                               -- hands the claimed rows back to this worker
 ```
+
+Claiming clears `last_error` because the job is no longer resting on a failure — a
+`processing` row is in flight. The pre-claim value is still returned to the worker as
+`previous_last_error` (taken from the locked candidate row, so it is the value as of the
+claim) so that a claim released without ever running can put it back
+([graceful shutdown](#graceful-shutdown-ctrlc--sigterm)).
 
 Why this is safe:
 
@@ -416,10 +423,13 @@ On SIGINT/SIGTERM the worker stops claiming, waits for the jobs it already **dis
 finish (unchanged behaviour — their success/failure/retry paths run normally), then closes the
 pool. If shutdown begins while a claim batch is in flight, the claims from that batch that were
 **never dispatched** — `processing` with an incremented `attempts`, but with no handler started —
-are released back to `pending` (`attempts` decremented, `started_at = NULL`, `run_at = now()`) by
-`releaseUnstartedClaims`. The release is guarded by `status = 'processing' AND attempts = <the
-attempt this worker claimed>`, so **no execution attempt is consumed by work that never ran** and
-a stale worker cannot release a job a newer attempt owns. Worker log:
+are released back to `pending` (`attempts` decremented, `started_at = NULL`, `run_at = now()`,
+and the pre-claim `last_error` restored) by `releaseUnstartedClaims`. The release is guarded by
+`status = 'processing' AND attempts = <the attempt this worker claimed>`, so **no execution
+attempt is consumed by work that never ran**, and a stale worker cannot release a job a newer
+attempt owns — nor write a stale `last_error` onto a row it no longer owns. Because a released
+job is returned to exactly the state it was claimed from, a retry that was claimed but never
+dispatched keeps the error message from the attempt that did run. Worker log:
 `released N unstarted claim(s) back to pending during shutdown ids=...`. If the release itself
 fails, those jobs fall back to [stuck-job recovery](#stuck-job-recovery) as before.
 
@@ -1263,8 +1273,9 @@ performs **zero DeepSeek API requests**.
 
 ### Test J — automated shutdown claim release (`npm run verify:shutdown`)
 
-Proves a claimed-but-undispatched job goes back to `pending` without burning an attempt, and that
-a wrong attempt value releases nothing. Build first, then run (talks to PostgreSQL directly
+Proves a claimed-but-undispatched job goes back to `pending` without burning an attempt, that
+the pre-claim `last_error` is restored with it, and that a wrong attempt value releases nothing
+and cannot touch `last_error`. Build first, then run (talks to PostgreSQL directly
 through the built repository; no server or worker needed):
 
 ```powershell
@@ -1276,7 +1287,16 @@ npm run verify:shutdown
 Checks: claim → `processing`/`attempts=1` → release with the correct attempt → 1 row,
 `pending`/`attempts=0`/`started_at=NULL` → a job not passed to the release is untouched → re-claim
 → `attempts=1` (same number) → release with a wrong attempt → 0 rows, row unchanged → a second
-release of an already-released job → 0 rows, `attempts=0`. Job rows are cleaned up afterwards.
+release of an already-released job → 0 rows, `attempts=0`.
+
+Then the **`last_error` restoration** regression (the peer-review scenario): a job is claimed as
+attempt 1, `recordJobFailure` records `DeepSeek timeout after 60000ms`, the job is re-claimed as
+attempt 2 (its `last_error` is now `NULL` while `processing`, and `claimJobs` returned the
+pre-claim error as `previous_last_error`), and the unstarted release returns it to
+`pending`/`attempts=1` with the previous `last_error` intact. Also checked: a stale attempt
+releases 0 rows and leaves `last_error` untouched, a fresh job with no previous failure still has
+`last_error = NULL` after an unstarted release, and omitting `previousLastError` cannot invent an
+error. Job rows are cleaned up afterwards.
 
 ## Verified Results and Evidence
 
