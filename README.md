@@ -193,6 +193,29 @@ The response also includes a `result` field: it is `null` until the worker has s
 persisted a `job_results` row, after which it contains the durable AI analysis output
 (`sentiment`, `rating`, `themes`, `complaints`, `quote`). Existing job fields are unchanged.
 
+### The `lastError` field
+
+`lastError` is the message from the most recent failed attempt, or `null` when there is no such
+message. It is always present in the response (as `null`, never omitted) regardless of `status`,
+and it describes **why the job last failed**, not necessarily what is happening right now:
+
+- a job on its **first** attempt has `lastError: null` — nothing has failed yet;
+- a job **waiting for a retry** (`pending` with a future `runAt`) has `lastError` set to the
+  message that scheduled that retry;
+- a job **being retried** (`processing` with `attempts > 1`) **still has `lastError` set** to that
+  same message. A retry claim does not clear it, so a client polling a flaky job can see *why* it
+  is on attempt 3 even though the retry is now in flight;
+- a job that **succeeds** has `lastError: null` again — success clears it;
+- a job that **fails again** has `lastError` set to the new message, replacing the old one;
+- a job that becomes **`dead`** carries the final failure message, or the recovery error if it was
+  ended by [stuck-job recovery](#stuck-job-recovery) after attempts were exhausted;
+- a job **manually retried** from the dead-letter view has `lastError: null` — that is an
+  explicit operator reset of a finished job.
+
+So `attempts` tells a client how many times the job has run and `lastError` tells it what went
+wrong on the last of those runs. `runAt` and `lastError` together describe the current backoff,
+and `lastError` remains readable throughout the retry itself.
+
 ### Error responses
 
 Errors use a consistent JSON shape:
@@ -249,7 +272,7 @@ up to N jobs it runs (simplified):
 
 ```sql
 WITH candidates AS (
-  SELECT id, last_error
+  SELECT id
   FROM jobs
   WHERE status = 'pending' AND run_at <= now()
   ORDER BY run_at, id
@@ -257,17 +280,20 @@ WITH candidates AS (
   FOR UPDATE SKIP LOCKED          -- lock these rows, skip rows another worker locked
 )
 UPDATE jobs j
-SET status = 'processing', started_at = now(), attempts = j.attempts + 1, last_error = NULL
+SET status = 'processing', started_at = now(), attempts = j.attempts + 1
 FROM candidates c
 WHERE j.id = c.id
-RETURNING ..., c.last_error AS previous_last_error;
-                               -- hands the claimed rows back to this worker
+RETURNING ...;                    -- hands the claimed rows back to this worker
 ```
 
-Claiming clears `last_error` because the job is no longer resting on a failure — a
-`processing` row is in flight. The pre-claim value is still returned to the worker as
-`previous_last_error` (taken from the locked candidate row, so it is the value as of the
-claim) so that a claim released without ever running can put it back
+Claiming does **not** touch `last_error`. A retry that is claimed while the previous
+failure is still recorded keeps that error on the row, so the reason a job is on attempt
+3 stays visible in the status API for the whole retry rather than only during the short
+backoff window between attempts. The value changes only on a real outcome: a successful
+attempt clears it, a further failure replaces it, stuck-job recovery overwrites it with
+its recovery error, and an operator's manual reset of a `dead` job clears it. That also
+means an unstarted claim released on shutdown needs no error restoration — the value it
+returns to is the value it was claimed from
 ([graceful shutdown](#graceful-shutdown-ctrlc--sigterm)).
 
 Why this is safe:
@@ -423,13 +449,14 @@ On SIGINT/SIGTERM the worker stops claiming, waits for the jobs it already **dis
 finish (unchanged behaviour — their success/failure/retry paths run normally), then closes the
 pool. If shutdown begins while a claim batch is in flight, the claims from that batch that were
 **never dispatched** — `processing` with an incremented `attempts`, but with no handler started —
-are released back to `pending` (`attempts` decremented, `started_at = NULL`, `run_at = now()`,
-and the pre-claim `last_error` restored) by `releaseUnstartedClaims`. The release is guarded by
+are released back to `pending` (`attempts` decremented, `started_at = NULL`, `run_at = now()`) by
+`releaseUnstartedClaims`. The release is guarded by
 `status = 'processing' AND attempts = <the attempt this worker claimed>`, so **no execution
-attempt is consumed by work that never ran**, and a stale worker cannot release a job a newer
-attempt owns — nor write a stale `last_error` onto a row it no longer owns. Because a released
-job is returned to exactly the state it was claimed from, a retry that was claimed but never
-dispatched keeps the error message from the attempt that did run. Worker log:
+attempt is consumed by work that never ran** and a stale worker cannot release a job a newer
+attempt owns. The release deliberately does not write `last_error`: a claim never destroyed the
+value, so a retry that was claimed but never dispatched goes straight back to `pending` still
+carrying the error from the attempt that did run — a released job is returned to exactly the
+state it was claimed from. Worker log:
 `released N unstarted claim(s) back to pending during shutdown ids=...`. If the release itself
 fails, those jobs fall back to [stuck-job recovery](#stuck-job-recovery) as before.
 
@@ -710,7 +737,7 @@ store, the table is durable and queryable — no separate queue needed for this 
 | `status`         | `text`        | Yes      | Lifecycle state; constrained to the five values below.                                |
 | `attempts`       | `integer`     | Yes      | Number of times the job has been claimed/started; incremented atomically on claim.   |
 | `max_attempts`   | `integer`     | Yes      | Retry budget: the job becomes `dead` once `attempts` reaches this value.              |
-| `last_error`     | `text`        | No       | Error message from the most recent failed attempt, when any.                          |
+| `last_error`     | `text`        | No       | Error message from the most recent failed attempt, when any. Retained while a retry is being processed; cleared on success and on a manual reset of a dead job. See [The `lastError` field](#the-lasterror-field). |
 | `run_at`         | `timestamptz` | Yes      | When the job becomes eligible to run; also the scheduled time of the next retry.       |
 | `started_at`     | `timestamptz` | No       | Set when a worker claims the job; cleared when a retry is scheduled; used to detect stuck jobs. |
 | `finished_at`    | `timestamptz` | No       | Set when the job reaches a terminal outcome (`succeeded` or `dead`).                   |
@@ -1274,8 +1301,8 @@ performs **zero DeepSeek API requests**.
 ### Test J — automated shutdown claim release (`npm run verify:shutdown`)
 
 Proves a claimed-but-undispatched job goes back to `pending` without burning an attempt, that
-the pre-claim `last_error` is restored with it, and that a wrong attempt value releases nothing
-and cannot touch `last_error`. Build first, then run (talks to PostgreSQL directly
+its `last_error` is carried through the claim and the release untouched, and that a wrong attempt
+value releases nothing. Build first, then run (talks to PostgreSQL directly
 through the built repository; no server or worker needed):
 
 ```powershell
@@ -1289,21 +1316,24 @@ Checks: claim → `processing`/`attempts=1` → release with the correct attempt
 → `attempts=1` (same number) → release with a wrong attempt → 0 rows, row unchanged → a second
 release of an already-released job → 0 rows, `attempts=0`.
 
-Then the **`last_error` restoration** regression (the peer-review scenario): a job is claimed as
-attempt 1, `recordJobFailure` records `DeepSeek timeout after 60000ms`, the job is re-claimed as
-attempt 2 (its `last_error` is now `NULL` while `processing`, and `claimJobs` returned the
-pre-claim error as `previous_last_error`), and the unstarted release returns it to
-`pending`/`attempts=1` with the previous `last_error` intact. Also checked: a stale attempt
-releases 0 rows and leaves `last_error` untouched, a fresh job with no previous failure still has
-`last_error = NULL` after an unstarted release, and omitting `previousLastError` cannot invent an
-error. Job rows are cleaned up afterwards.
+Then the **`last_error` preservation** checks. A job is claimed as attempt 1,
+`recordJobFailure` records `DeepSeek timeout after 60000ms`, and the job is re-claimed as attempt
+2. The claim moves it to `processing` **without clearing the error**, so the row still shows the
+previous failure while the retry runs; the unstarted release returns it to `pending`/`attempts=1`
+with that same error still in place — the release does not write `last_error` at all. Also
+checked: a stale attempt releases 0 rows and changes neither `status`/`attempts` nor `last_error`;
+a further failure **replaces** the older error rather than retaining it; a successful attempt
+still **clears** it (`completeJobSucceeded`, now the only thing that does so on the happy path);
+and a fresh job that has never failed stays `last_error = NULL` across both the claim and the
+release. Job rows are cleaned up afterwards.
 
-**What this test covers — and what it does not.** It exercises the release operation
-directly against PostgreSQL. It does **not** start a `WorkerProcess` and does **not** send
-`SIGTERM`/`SIGINT`, so the worker-side shutdown orchestration is not exercised here: neither
-the claim cycle releasing its undispatched claims, nor `claimCycles` tracking, nor draining an
-in-flight claim cycle before the pool closes. Those are covered by the code path and the
-`released N unstarted claim(s)` log line, not by this deterministic test.
+**What this test covers — and what it does not.** It exercises the claim, release, failure, and
+guarded-completion operations directly against PostgreSQL. It does **not** start a
+`WorkerProcess` and does **not** send `SIGTERM`/`SIGINT`, so the worker-side shutdown
+orchestration is not exercised here: neither the claim cycle releasing its undispatched claims,
+nor `claimCycles` tracking, nor draining an in-flight claim cycle before the pool closes. Those
+are covered by the code path and the `released N unstarted claim(s)` log line, not by this
+deterministic test.
 
 **Queue isolation.** `claimJobs()` selects the globally oldest eligible rows
 (`ORDER BY run_at ASC, id ASC`) with no filter, by design. This script therefore gives its own

@@ -6,15 +6,11 @@ const JOB_RETURN_COLUMNS = JOB_SELECT_COLUMNS.split(',')
   .map((column) => `j.${column.trim()}`)
   .join(', ');
 
-export interface ClaimedJob extends JobRow {
-  previous_last_error: string | null;
-}
-
-export async function claimJobs(limit: number): Promise<ClaimedJob[]> {
-  const result = await pool.query<ClaimedJob>(
+export async function claimJobs(limit: number): Promise<JobRow[]> {
+  const result = await pool.query<JobRow>(
     `
     WITH candidates AS (
-      SELECT id, last_error
+      SELECT id
       FROM jobs
       WHERE status = 'pending' AND run_at <= now()
       ORDER BY run_at ASC, id ASC
@@ -24,11 +20,10 @@ export async function claimJobs(limit: number): Promise<ClaimedJob[]> {
     UPDATE jobs j
     SET status = 'processing',
         started_at = now(),
-        attempts = j.attempts + 1,
-        last_error = NULL
+        attempts = j.attempts + 1
     FROM candidates c
     WHERE j.id = c.id
-    RETURNING ${JOB_RETURN_COLUMNS}, c.last_error AS previous_last_error
+    RETURNING ${JOB_RETURN_COLUMNS}
     `,
     [limit]
   );
@@ -38,7 +33,6 @@ export async function claimJobs(limit: number): Promise<ClaimedJob[]> {
 export interface UnstartedClaim {
   id: string;
   attempt: number;
-  previousLastError?: string | null;
 }
 
 export async function releaseUnstartedClaims(
@@ -47,32 +41,22 @@ export async function releaseUnstartedClaims(
   if (claims.length === 0) {
     return 0;
   }
-  const params: Array<[string, number, string | null]> = claims.map((claim) => [
-    claim.id,
-    claim.attempt,
-    claim.previousLastError ?? null,
-  ]);
   const released = await pool.query(
     `WITH claimed AS (
-       SELECT * FROM unnest($1::uuid[], $2::int[], $3::text[]) AS c(id, attempt, previous_error)
+       SELECT * FROM unnest($1::uuid[], $2::int[]) AS c(id, attempt)
      )
      UPDATE jobs j
      SET status = 'pending',
          attempts = GREATEST(j.attempts - 1, 0),
          run_at = now(),
          started_at = NULL,
-         finished_at = NULL,
-         last_error = COALESCE(c.previous_error, j.last_error)
+         finished_at = NULL
      FROM claimed c
      WHERE j.id = c.id
        AND j.status = 'processing'
        AND j.attempts = c.attempt
      RETURNING j.id`,
-    [
-      params.map(([id]) => id),
-      params.map(([, attempt]) => attempt),
-      params.map(([, , previousError]) => previousError),
-    ]
+    [claims.map((claim) => claim.id), claims.map((claim) => claim.attempt)]
   );
   return released.rowCount ?? 0;
 }

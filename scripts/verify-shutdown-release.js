@@ -14,6 +14,7 @@ if (fs.existsSync(dotenvPath)) {
 const { pool } = require(path.join(root, 'dist', 'config', 'database.js'));
 const {
   claimJobs,
+  completeJobSucceeded,
   recordJobFailure,
   releaseUnstartedClaims,
 } = require(path.join(root, 'dist', 'worker', 'jobs.worker.repository.js'));
@@ -219,9 +220,15 @@ async function main() {
       finalState.status === 'pending' && finalState.attempts === 0
     );
 
-    console.log('\n-- last_error restoration on an unstarted release --');
+    console.log('\n-- last_error is preserved across claim and release --');
 
+    // A retry claim no longer destroys last_error, so the release has nothing to
+    // restore: it must simply leave the value alone. These checks prove that
+    // invariant end to end -- claim preserves it, release preserves it, a stale
+    // release cannot touch it, and only a real outcome (failure or success)
+    // changes it.
     const priorFailure = 'DeepSeek timeout after 60000ms';
+    const secondFailure = 'DeepSeek returned an unparseable response';
     const retryId = await insertJob('previous-error');
 
     await prepareSingleTargetClaim(retryId);
@@ -229,10 +236,6 @@ async function main() {
     check(
       'retry scenario: attempt 1 claimed (processing, attempts=1)',
       attempt1.status === 'processing' && attempt1.attempts === 1
-    );
-    check(
-      'fresh job reported no previous error to restore (previous_last_error=NULL)',
-      attempt1.previous_last_error === null
     );
 
     const failureOutcome = await recordJobFailure(retryId, priorFailure, 1, 5, 0);
@@ -256,68 +259,104 @@ async function main() {
       attempt2.status === 'processing' && attempt2.attempts === 2
     );
     check(
-      'claim cleared last_error on the processing row (last_error=NULL)',
-      attempt2.last_error === null
-    );
-    check(
-      'claim returned the pre-claim error for restoration (previous_last_error)',
-      attempt2.previous_last_error === priorFailure
+      'claim PRESERVES the previous failure while the retry is processing',
+      attempt2.last_error === priorFailure
     );
 
-    const staleErrorRows = await releaseUnstartedClaims([
-      {
-        id: retryId,
-        attempt: attempt2.attempts + 1,
-        previousLastError: 'stale worker must never write this',
-      },
+    const retryStaleRows = await releaseUnstartedClaims([
+      { id: retryId, attempt: attempt2.attempts + 1 },
     ]);
-    check('retry scenario: a stale attempt released 0 rows', staleErrorRows === 0);
+    check('retry scenario: a stale attempt released 0 rows', retryStaleRows === 0);
 
-    const afterStaleError = await readState(retryId);
+    const afterRetryStale = await readState(retryId);
     check(
-      'retry scenario: a stale attempt left last_error and state untouched (processing, attempts=2, last_error=NULL)',
-      afterStaleError.status === 'processing' &&
-        afterStaleError.attempts === 2 &&
-        afterStaleError.last_error === null
+      'retry scenario: a stale attempt changed nothing (processing, attempts=2, last_error untouched)',
+      afterRetryStale.status === 'processing' &&
+        afterRetryStale.attempts === 2 &&
+        afterRetryStale.last_error === priorFailure
     );
 
-    const restoredRows = await releaseUnstartedClaims([
-      {
-        id: retryId,
-        attempt: attempt2.attempts,
-        previousLastError: attempt2.previous_last_error,
-      },
+    const retryReleasedRows = await releaseUnstartedClaims([
+      { id: retryId, attempt: attempt2.attempts },
     ]);
-    check('retry scenario: releasing the exact claimed attempt released 1 row', restoredRows === 1);
-
-    const restoredState = await readState(retryId);
     check(
-      'retry scenario: released job -> pending, attempts=1, previous last_error restored',
-      restoredState.status === 'pending' &&
-        restoredState.attempts === 1 &&
-        restoredState.last_error === priorFailure
-    );
-    check(
-      'retry scenario: restored job is claimable again (run_at <= now())',
-      new Date(restoredState.run_at).getTime() <= Date.now()
+      'retry scenario: releasing the exact claimed attempt released 1 row',
+      retryReleasedRows === 1
     );
 
+    const retryReleasedState = await readState(retryId);
+    check(
+      'release PRESERVES the previous failure while returning the job to pending',
+      retryReleasedState.status === 'pending' &&
+        retryReleasedState.attempts === 1 &&
+        retryReleasedState.last_error === priorFailure
+    );
+    check(
+      'retry scenario: released job is claimable again (run_at <= now())',
+      new Date(retryReleasedState.run_at).getTime() <= Date.now()
+    );
+
+    // A later failure must replace the error rather than letting the older one win.
+    await prepareSingleTargetClaim(retryId);
+    const attempt3 = requireClaim(await claimOwn(1), retryId);
+    check(
+      'retry scenario: re-claimed again -> processing, attempts=2, previous error still carried',
+      attempt3.status === 'processing' &&
+        attempt3.attempts === 2 &&
+        attempt3.last_error === priorFailure
+    );
+
+    const secondOutcome = await recordJobFailure(retryId, secondFailure, 2, 5, 0);
+    check(
+      'retry scenario: the second failure was recorded (outcome=retry)',
+      secondOutcome === 'retry'
+    );
+
+    const afterSecondFailure = await readState(retryId);
+    check(
+      'a new failure REPLACES the previous error instead of retaining it',
+      afterSecondFailure.status === 'pending' &&
+        afterSecondFailure.attempts === 2 &&
+        afterSecondFailure.last_error === secondFailure
+    );
+
+    // Success is the other way the value changes, and it must still clear it
+    // now that the claim no longer does.
+    await prepareSingleTargetClaim(retryId);
+    const attempt4 = requireClaim(await claimOwn(1), retryId);
+    check(
+      'success scenario: re-claimed -> processing, attempts=3, previous error still carried',
+      attempt4.status === 'processing' &&
+        attempt4.attempts === 3 &&
+        attempt4.last_error === secondFailure
+    );
+
+    const owned = await completeJobSucceeded(retryId, attempt4.attempts, {
+      origin: 'verify-shutdown-release',
+    });
+    check('success scenario: the owning attempt completed (owned=true)', owned === true);
+
+    const afterSuccess = await readState(retryId);
+    check(
+      'success CLEARS the carried error (succeeded, finished_at set, last_error=NULL)',
+      afterSuccess.status === 'succeeded' &&
+        afterSuccess.finished_at !== null &&
+        afterSuccess.last_error === null
+    );
+
+    // A job that has never failed has nothing to preserve and stays NULL.
     const freshId = await insertJob('no-previous-error');
     await prepareSingleTargetClaim(freshId);
     const freshClaim = requireClaim(await claimOwn(1), freshId);
     check(
-      'fresh job claimed -> processing, attempts=1, previous_last_error=NULL',
+      'fresh job claimed -> processing, attempts=1, last_error still NULL',
       freshClaim.status === 'processing' &&
         freshClaim.attempts === 1 &&
-        freshClaim.previous_last_error === null
+        freshClaim.last_error === null
     );
 
     const freshRows = await releaseUnstartedClaims([
-      {
-        id: freshId,
-        attempt: freshClaim.attempts,
-        previousLastError: freshClaim.previous_last_error,
-      },
+      { id: freshId, attempt: freshClaim.attempts },
     ]);
     check('fresh job released 1 row', freshRows === 1);
 
@@ -327,12 +366,6 @@ async function main() {
       freshState.status === 'pending' &&
         freshState.attempts === 0 &&
         freshState.last_error === null
-    );
-
-    const omittedRows = await releaseUnstartedClaims([{ id: freshId, attempt: 1 }]);
-    check(
-      'omitting previousLastError cannot resurrect an error (0 rows, last_error stays NULL)',
-      omittedRows === 0 && (await readState(freshId)).last_error === null
     );
   } finally {
     try {

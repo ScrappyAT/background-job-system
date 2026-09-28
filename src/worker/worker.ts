@@ -5,7 +5,6 @@ import { JobRow } from '../jobs/job.model';
 import { getHandler } from './job.handlers';
 import {
   claimJobs,
-  ClaimedJob,
   completeJobSucceeded,
   recordJobFailure,
   recoverStuckJobs,
@@ -85,7 +84,7 @@ class WorkerProcess {
   }
 
   private async runClaimCycle(freeSlots: number): Promise<void> {
-    let claimed: ClaimedJob[] = [];
+    let claimed: JobRow[] = [];
     let dispatched = 0;
     try {
       claimed = await claimJobs(freeSlots);
@@ -105,14 +104,10 @@ class WorkerProcess {
     }
   }
 
-  private async releaseUndispatched(undispatched: ClaimedJob[]): Promise<void> {
+  private async releaseUndispatched(undispatched: JobRow[]): Promise<void> {
     try {
       const released = await releaseUnstartedClaims(
-        undispatched.map((job) => ({
-          id: job.id,
-          attempt: job.attempts,
-          previousLastError: job.previous_last_error,
-        }))
+        undispatched.map((job) => ({ id: job.id, attempt: job.attempts }))
       );
       console.log(
         `[${this.id}] released ${released} unstarted claim(s) back to pending during shutdown ` +
