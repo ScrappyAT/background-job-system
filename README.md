@@ -1298,6 +1298,20 @@ releases 0 rows and leaves `last_error` untouched, a fresh job with no previous 
 `last_error = NULL` after an unstarted release, and omitting `previousLastError` cannot invent an
 error. Job rows are cleaned up afterwards.
 
+**What this test covers — and what it does not.** It exercises the release operation
+directly against PostgreSQL. It does **not** start a `WorkerProcess` and does **not** send
+`SIGTERM`/`SIGINT`, so the worker-side shutdown orchestration is not exercised here: neither
+the claim cycle releasing its undispatched claims, nor `claimCycles` tracking, nor draining an
+in-flight claim cycle before the pool closes. Those are covered by the code path and the
+`released N unstarted claim(s)` log line, not by this deterministic test.
+
+**Queue isolation.** `claimJobs()` selects the globally oldest eligible rows
+(`ORDER BY run_at ASC, id ASC`) with no filter, by design. This script therefore gives its own
+rows a fixed historical `run_at` so they sort ahead of any application job, and it **refuses to
+run** (exit code `2`, nothing modified) if it finds unrelated pending jobs that are already
+eligible to be claimed. It never deletes, reschedules, or otherwise mutates unrelated jobs, and
+asserts at the end that no `shutdown-release-*` rows and no unrelated row changes remain.
+
 ## Verified Results and Evidence
 
 The results below are what was **actually observed** during manual verification. Each entry
@@ -1467,7 +1481,7 @@ Evidence:
 
 > An earlier, smaller-scale snapshot of the same cap behaviour is also committed:
 > [04-concurrency-cap-preliminary](evidence/04-concurrency-cap-preliminary.png). It is a
-> preliminary concurrency observation, not one of the eight numbered tests above.
+> preliminary concurrency observation, not one of the ten numbered tests above.
 
 ## Requirement-to-Evidence Map
 
