@@ -801,7 +801,16 @@ Copy `.env.example` to `.env` and fill in real values. Never commit `.env`.
 
 Prerequisites: Node.js 20+, npm, and a running PostgreSQL instance.
 
+The repository root **is** the project root — `package.json`, `src/`, and `scripts/` all sit
+directly in it, so every command below is run from that one directory. There is no nested
+`background-job-system` directory to descend into; the only directory change needed is the single
+`cd` into the directory `git clone` creates.
+
 ```powershell
+# 0. Clone the repository and step into the single checkout directory
+git clone https://github.com/ScrappyAT/background-job-system.git
+cd background-job-system
+
 # 1. Install dependencies
 npm install
 
@@ -821,6 +830,27 @@ npm start
 npm run dev
 ```
 
+**`.env` is required and is never in the clone.** `.env` is listed in `.gitignore` on purpose, so
+a fresh clone does not contain one and every startup step below must be preceded by step 2. The
+API and the worker both refuse to boot without it, and they name the missing variable rather than
+falling back to a default:
+
+```
+Error: Required environment variable DATABASE_URL is not set. Copy .env.example to .env
+and configure DATABASE_URL.
+```
+
+`DATABASE_URL` is the **only** mandatory variable at startup — it is the PostgreSQL connection
+string your own instance uses, and the placeholder in `.env.example` is meant to be edited to
+point at it. Every other variable in `.env.example` already has a working default, so leaving them
+untouched is fine.
+
+`DEEPSEEK_API_KEY` is **optional at startup**. Without it the API and the worker start normally
+and the schema migrates normally; only a *real* review analysis needs it, and a real job submitted
+without one fails with a clear provider error and follows the usual retry/backoff/dead lifecycle
+(the `testFailureMode` break-tests still throw before any provider call, so they need no key
+either). Add the key only when you want real AI results.
+
 Verify the API is up:
 
 ```powershell
@@ -830,8 +860,11 @@ Invoke-RestMethod -Uri http://localhost:3000/health
 
 ## Project structure
 
+The name below is the **repository root / checkout directory** — the one directory `git clone`
+creates. Its contents are the repository contents; there is no nested project folder inside it.
+
 ```
-background-job-system/
+background-job-system/    # repository root / checkout directory
 ├── .env.example          # Documented environment variables (no secrets)
 ├── .gitignore            # Ignores node_modules, dist, .env
 ├── package.json          # Scripts and dependencies

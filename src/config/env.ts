@@ -17,7 +17,9 @@ function intFromEnv(name: string, fallback: number): number {
 function requiredFromEnv(name: string): string {
   const value = process.env[name];
   if (value === undefined || value === '') {
-    throw new Error(`Required environment variable ${name} is not set`);
+    throw new Error(
+      `Required environment variable ${name} is not set. Copy .env.example to .env and configure ${name}.`
+    );
   }
   return value;
 }
