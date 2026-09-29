@@ -460,6 +460,20 @@ state it was claimed from. Worker log:
 `released N unstarted claim(s) back to pending during shutdown ids=...`. If the release itself
 fails, those jobs fall back to [stuck-job recovery](#stuck-job-recovery) as before.
 
+This behaviour is covered by **two complementary automated verifications**, at different layers:
+
+- **`npm run verify:shutdown`** (Test J) — **repository level**. It proves the
+  `releaseUnstartedClaims` SQL semantics directly against PostgreSQL: the guarded attempt match,
+  the `attempts` decrement, `started_at` clearing, `last_error` preservation, and that a stale
+  attempt releases nothing.
+- **`npm run verify:worker-shutdown`** (Test K) — **orchestration level**. It runs the **real
+  `WorkerProcess`**, holds a claim cycle open at the exact point where rows are claimed but not
+  yet dispatched, calls `shutdown()` there, and proves the worker releases exactly those rows back
+  to `pending` without burning an attempt and closes the pool only afterwards. It calls
+  `shutdown()` directly rather than sending a real OS signal: that is the same orchestration the
+  `SIGINT`/`SIGTERM` handler invokes, and it keeps the test deterministic and cross-platform (see
+  Test K for why). **Delivery of `SIGINT`/`SIGTERM` itself remains a manual check.**
+
 ### Review-analysis handler (real DeepSeek API)
 
 `review_analysis` jobs call the **DeepSeek API** (OpenAI-compatible) via the official
@@ -886,7 +900,7 @@ background-job-system/    # repository root / checkout directory
 │   │   ├── env.ts        # Loads/validates environment config
 │   │   └── database.ts   # pg connection pool built from DATABASE_URL
 │   ├── worker/
-│   │   ├── worker.ts                # Poll loop, stuck-job sweep, concurrency cap, graceful shutdown
+│   │   ├── worker.ts                # WorkerProcess class (poll loop, sweep, concurrency cap, graceful shutdown) + entry-point bootstrap
 │   │   ├── job.handlers.ts          # review_analysis handler (real DeepSeek call + break-test hooks)
 │   │   ├── deepseek.client.ts       # OpenAI SDK → DeepSeek, JSON mode, local Zod + quote validation
 │   │   ├── retry.ts                 # Exponential backoff + bounded jitter scheduling
@@ -898,7 +912,8 @@ background-job-system/    # repository root / checkout directory
 │   │       └── run.ts                # Migration runner (ordered, tracked, transactional)
 ├── scripts/
 │   ├── verify-stale-guard.js  # Automated demo: a stale worker cannot complete a newer attempt
-│   └── verify-shutdown-release.js # Automated demo: shutdown releases claimed-but-undispatched jobs
+│   ├── verify-shutdown-release.js # Automated demo: shutdown releases claimed-but-undispatched jobs (repository level)
+│   └── verify-worker-shutdown.js # Automated demo: the real WorkerProcess releases them on shutdown (orchestration level)
 ├── evidence/
 │   └── *.png                  # Committed screenshots/transcripts of manual verification
 ```
@@ -940,6 +955,10 @@ background-job-system/    # repository root / checkout directory
 
 - A standalone **worker** process (`npm run worker`) with its own poll loop, an in-process
   concurrency cap (`WORKER_CONCURRENCY`), and graceful shutdown on SIGINT/SIGTERM.
+  `src/worker/worker.ts` exports the `WorkerProcess` class and keeps its bootstrap (starting the
+  poll loop and registering the `SIGINT`/`SIGTERM` handlers) behind
+  `if (require.main === module)`, so the worker still starts automatically when the file is the
+  process entry point, while the class itself can be loaded and driven by a verification.
 - **Atomic claiming** using `SELECT ... FOR UPDATE SKIP LOCKED` merged with `UPDATE ...
   FROM` + `RETURNING` in one statement, so no job can be claimed twice even with multiple
   workers running (verified by running two workers concurrently).
@@ -1027,7 +1046,7 @@ background-job-system/    # repository root / checkout directory
 
 These are deliberately deferred to later phases.
 
-## Manual verification (Tests A–J)
+## Manual verification (Tests A–K)
 
 Prerequisites: API running (`npm start`) and worker running (`npm run worker:start`) in two
 separate terminals, using the default `JOB_MAX_ATTEMPTS = 5` and `JOB_BASE_DELAY_MS = 1000`.
@@ -1331,7 +1350,7 @@ fails locally (`testFailureMode: always` — thrown **before** the DeepSeek call
 job. Because the forced failure short-circuits before the provider call, this break test
 performs **zero DeepSeek API requests**.
 
-### Test J — automated shutdown claim release (`npm run verify:shutdown`)
+### Test J — automated shutdown claim release, repository level (`npm run verify:shutdown`)
 
 Proves a claimed-but-undispatched job goes back to `pending` without burning an attempt, that
 its `last_error` is carried through the claim and the release untouched, and that a wrong attempt
@@ -1360,13 +1379,21 @@ still **clears** it (`completeJobSucceeded`, now the only thing that does so on 
 and a fresh job that has never failed stays `last_error = NULL` across both the claim and the
 release. Job rows are cleaned up afterwards.
 
-**What this test covers — and what it does not.** It exercises the claim, release, failure, and
-guarded-completion operations directly against PostgreSQL. It does **not** start a
-`WorkerProcess` and does **not** send `SIGTERM`/`SIGINT`, so the worker-side shutdown
-orchestration is not exercised here: neither the claim cycle releasing its undispatched claims,
-nor `claimCycles` tracking, nor draining an in-flight claim cycle before the pool closes. Those
-are covered by the code path and the `released N unstarted claim(s)` log line, not by this
-deterministic test.
+**What this test covers — and what it does not.** This is the **repository-level** verification:
+it exercises the claim, release, failure, and guarded-completion operations directly against
+PostgreSQL. It does **not** start a `WorkerProcess` and does **not** send `SIGTERM`/`SIGINT`, so
+the worker-side shutdown orchestration is not exercised here — neither the claim cycle releasing
+its undispatched claims, nor `claimCycles` tracking, nor draining an in-flight claim cycle before
+the pool closes.
+
+That orchestration **is** covered automatically, by a separate verification: **Test K**
+(`npm run verify:worker-shutdown`), which runs the real `WorkerProcess` class. The two scripts are
+complementary and cover different layers:
+
+| Verification                   | Layer under test                                                                                          | Starts `WorkerProcess`? | Sends an OS signal? |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------- | ----------------------- | ------------------- |
+| `npm run verify:shutdown`      | `jobs.worker.repository.ts` — claim / release / failure / ownership SQL                                     | No                      | No                  |
+| `npm run verify:worker-shutdown` | `WorkerProcess` shutdown orchestration — `claimCycles` drain, undispatched release, pool close afterwards  | **Yes**                 | No — it calls `shutdown()` directly |
 
 **Queue isolation.** `claimJobs()` selects the globally oldest eligible rows
 (`ORDER BY run_at ASC, id ASC`) with no filter, by design. This script therefore gives its own
@@ -1374,6 +1401,83 @@ rows a fixed historical `run_at` so they sort ahead of any application job, and 
 run** (exit code `2`, nothing modified) if it finds unrelated pending jobs that are already
 eligible to be claimed. It never deletes, reschedules, or otherwise mutates unrelated jobs, and
 asserts at the end that no `shutdown-release-*` rows and no unrelated row changes remain.
+
+### Test K — automated WorkerProcess shutdown orchestration (`npm run verify:worker-shutdown`)
+
+Proves the **real `WorkerProcess` class** releases jobs that were claimed but never dispatched when
+shutdown begins mid-claim-cycle, that it does so **without burning an attempt**, and that it waits
+for the active claim cycle instead of closing the database pool underneath it. Build first, then
+run (no server needed; it loads the built worker module and needs PostgreSQL):
+
+```powershell
+npm run build
+npm run verify:worker-shutdown
+# ALL PASS on success; exits non-zero on failure.
+```
+
+**What it does.** It inserts two pending jobs, constructs the real `new WorkerProcess(claim)` with
+`WORKER_CONCURRENCY=2`, and starts it with `start()`. The poll loop claims both jobs for real
+through `claimJobs()`, and the injected claim function then **holds the claim cycle open** at
+exactly the point that matters: the rows are committed as `processing`/`attempts=1`, `claimCycles`
+already tracks the cycle, and the dispatch loop has not run yet. While it is held open the test
+calls `worker.shutdown()` and only then lets the claim cycle finish. The worker resumes with
+`shuttingDown === true`, dispatches nothing, and runs its real `releaseUndispatched()` path.
+
+The 23 checks, grouped:
+
+1. `start()` ran one real claim cycle that claimed **2** jobs from PostgreSQL;
+2. while the cycle is held open both jobs are `processing` with `attempts = 1` (the real claim);
+3. while it is held open neither job has been dispatched (no `claimed job …` log line);
+4. `WorkerProcess.shutdown()` was actually invoked;
+5. shutdown did **not** close the application pool while a claim cycle was still in flight;
+6. `shutdown()` resolved without rejecting or timing out;
+7. shutdown **waited** for the active claim cycle — the pool was still open at the moment the cycle
+   resumed, i.e. it did not close the pool underneath the release;
+8. the application pool **is** closed once shutdown completes, and the poll loop exited;
+9. the real `releaseUndispatched` orchestration ran and released **both** claims
+   (`released 2 unstarted claim(s) … ids=<both>`);
+10. that release happened **before** `database pool closed; shutdown complete`;
+11. the release did not fail and fall back to stuck-job recovery (no error output at all);
+12. no handler ever started — no `claimed job …` line, no `job_results` row, and `last_error` is
+    still `NULL` (the payload carries `testFailureMode: "always"`, so a dispatched job would have
+    recorded a failure — with **zero DeepSeek requests**);
+13. both jobs are back to `pending` with `attempts = 0` (**no attempt burned**),
+    `started_at`/`finished_at` cleared, `last_error` still `NULL`, and `run_at <= now()` so they
+    are immediately claimable again;
+14. no `worker-shutdown-*` rows are left behind, and no unrelated job row was added or modified.
+
+**Why it calls `shutdown()` directly instead of sending a real signal.** The `SIGINT`/`SIGTERM`
+handler does nothing except call `worker.shutdown()` (`src/worker/worker.ts`): a re-entrancy
+guard, a log line, that call, an error log, `process.exit(0)`, and a 30 s failsafe timer. Calling
+`shutdown()` directly therefore exercises **the same shutdown orchestration** the signal handler
+invokes while skipping signal *delivery*. That is deliberate, for three reasons:
+
+- **It is deterministic.** The dispatch loop in `runClaimCycle()` is synchronous, so a signal can
+  only be observed by it if `shuttingDown` was already `true` when the loop began. The window a
+  real signal would have to land in — between `claimJobs()` resolving and the loop running — is a
+  sub-millisecond gap containing no log line and no database state, so a signal-based test could
+  only ever sleep and hope to interrupt the worker at the right moment. The barrier removes the
+  race entirely: the worker is parked, not raced.
+- **It is cross-platform.** On Windows, `process.kill(pid, 'SIGINT'/'SIGTERM')` terminates the
+  target process instead of delivering a signal the JavaScript handler can run, so a
+  child-process signal test would not exercise the shutdown path at all on this project's
+  platform.
+- **It asserts real state, not log scraping.** The test checks that the exact rows returned to
+  `pending` with the right attempt numbers, which is stronger evidence than asserting that a log
+  line appeared.
+
+**What is still not automated:** the delivery of `SIGINT`/`SIGTERM` itself. That remains a manual
+check (start a worker, press Ctrl+C, watch the log). The handler body is unchanged production
+code.
+
+**Queue isolation.** The same isolation strategy as `verify:shutdown` is used: a fixed historical
+`run_at` so the script's rows sort ahead of any application job, a **refusal to run** (exit code
+`2`, nothing modified) if any unrelated row would be mutated by either the claim or the worker's
+stuck-job sweep, an `md5` fingerprint of every unrelated row taken before and after, and cleanup
+that deletes only rows this script created. The worker is additionally run with a 24 h
+`JOB_STUCK_TIMEOUT_MS` so its per-cycle stuck-job sweep is a guaranteed no-op during the run.
+Because `shutdown()` closes the application's `pg` pool, all post-shutdown assertions read through
+a separate, test-owned PostgreSQL connection.
 
 ## Verified Results and Evidence
 
@@ -1546,11 +1650,37 @@ Evidence:
 > [04-concurrency-cap-preliminary](evidence/04-concurrency-cap-preliminary.png). It is a
 > preliminary concurrency observation, not one of the ten numbered tests above.
 
+### 9. Automated shutdown-release verification (two layers)
+
+`npm run verify:shutdown` (repository level, in-repo) performs **33 checks** over the claim,
+release, failure, and guarded-completion SQL, including the `last_error` preservation invariants.
+
+`npm run verify:worker-shutdown` (orchestration level, in-repo) performs **23 checks** against the
+**real `WorkerProcess` class**: a claim cycle is held open with both rows really committed as
+`processing`/`attempts=1`, `shutdown()` is invoked at that point, and the worker then resumes with
+`shuttingDown === true`, dispatches nothing, and releases both claims.
+
+Observed result: **23/23 PASS**, including that the release ran **before**
+`database pool closed; shutdown complete`, that the pool was still open at the instant the claim
+cycle resumed (shutdown drained the cycle rather than closing the pool underneath it), and that
+both jobs ended `pending` with `attempts = 0` (no attempt burned), `started_at` cleared,
+`last_error` untouched, and no `job_results` row.
+
+Observed result for a mutation check: deleting the single line `this.claimCycles.add(cycle)` —
+which makes `shutdown()` close the pool while the claim cycle is still running — leaves
+`npm run verify:shutdown` at **33/33 PASS** while `npm run verify:worker-shutdown` fails **7
+checks** (the release falls back to stuck-job recovery and both jobs are stranded in `processing`
+with `attempts = 1`). That difference is exactly the coverage gap the orchestration test closes.
+
+> No screenshots are committed for these tests — they are fully automated checks
+> (`npm run build`, then the `verify:*` scripts) whose output is the pass/fail report.
+> Delivery of `SIGINT`/`SIGTERM` itself is **not** automated; it remains a manual Ctrl+C check.
+
 ## Requirement-to-Evidence Map
 
 | Requirement              | Implementation                                                                                              | Verification                                    | Evidence                                                                        |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------- |
-| Immediate 202 enqueue    | `POST /api/jobs` validates + inserts, returns HTTP 202 (`src/jobs/jobs.routes.ts`)                           | Live via every POST; Tests A–J                  | no dedicated screenshot (all POST live runs)                                    |
+| Immediate 202 enqueue    | `POST /api/jobs` validates + inserts, returns HTTP 202 (`src/jobs/jobs.routes.ts`)                           | Live via every POST; Tests A–K                  | no dedicated screenshot (all POST live runs)                                    |
 | Idempotency              | DB `UNIQUE(idempotency_key)` + `INSERT ... ON CONFLICT DO NOTHING`                                           | Test 1                                          | [01-idempotency](evidence/01-idempotency.png)                                   |
 | Separate worker          | Independent process (`npm run worker`) polling PostgreSQL; no analysis in the API path                        | Worker logs in Tests B/F/I; live DeepSeek run   | [03-backoff-retries](evidence/03-backoff-retries.png), [11-50-job-concurrency-cap](evidence/11-50-job-concurrency-cap.png) |
 | Concurrency cap          | Per-process `active` set; claims `WORKER_CONCURRENCY - active` per cycle                                      | Test 8                                          | [11-50-job-concurrency-cap](evidence/11-50-job-concurrency-cap.png) (+ [04-concurrency-cap-preliminary](evidence/04-concurrency-cap-preliminary.png)) |
@@ -1564,6 +1694,8 @@ Evidence:
 | Manual retry             | `POST /api/jobs/:id/retry` atomic `WHERE status='dead'`; same id, fresh budget, payload/key preserved        | Test 4D/E                                       | [10-manual-retry-reset](evidence/10-manual-retry-reset.png)                      |
 | Real AI processing       | Worker → DeepSeek via openai SDK (`deepseek-flash`, `maxRetries: 0`)                                         | Live test (`e490…)`, attempt 1, ≈5199 ms         | none committed (worker log + DB row)                                             |
 | Structured result validation | Zod schema (`sentiment/rating/themes/complaints/quote`) + verbatim quote check                            | Live test result passed local validation         | none committed (stored result shown in Section 7 above)                          |
+| Graceful shutdown (release layer) | `releaseUnstartedClaims` guarded by `status='processing' AND attempts=$attempt`; `attempts` decremented, `started_at` cleared, `last_error` untouched | Test J — `npm run verify:shutdown` (33/33)       | none committed (automated check)                                                |
+| Graceful shutdown (orchestration layer) | `WorkerProcess` `claimCycles` drain, undispatched-claim release, and pool close after the drain (`src/worker/worker.ts`) | Test K — `npm run verify:worker-shutdown` (23/23) | none committed (automated check)                                                |
 
 ## Defence Notes
 

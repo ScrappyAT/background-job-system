@@ -16,7 +16,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-class WorkerProcess {
+/**
+ * The claim function the poll loop uses. It is injectable so a verification can hold a
+ * claim cycle open at a known point; production always uses the real `claimJobs`.
+ */
+export type ClaimJobs = typeof claimJobs;
+
+export class WorkerProcess {
   readonly id = `worker-${process.pid}`;
   private readonly concurrency = config.workerConcurrency;
   private readonly pollIntervalMs = config.workerPollIntervalMs;
@@ -24,6 +30,8 @@ class WorkerProcess {
   private readonly inFlight = new Set<Promise<void>>();
   private readonly claimCycles = new Set<Promise<void>>();
   private shuttingDown = false;
+
+  constructor(private readonly claim: ClaimJobs = claimJobs) {}
 
   start(): void {
     console.log(
@@ -87,7 +95,7 @@ class WorkerProcess {
     let claimed: JobRow[] = [];
     let dispatched = 0;
     try {
-      claimed = await claimJobs(freeSlots);
+      claimed = await this.claim(freeSlots);
       for (const job of claimed) {
         if (this.shuttingDown) {
           break;
@@ -216,24 +224,30 @@ class WorkerProcess {
   }
 }
 
-const worker = new WorkerProcess();
-worker.start();
+// Bootstrap only. Guarded so that importing this module (for example from a
+// verification) yields the WorkerProcess class without starting a poll loop or
+// registering process-wide signal handlers. `npm run worker` / `npm run worker:start`
+// execute this file directly, so require.main === module holds in production.
+if (require.main === module) {
+  const worker = new WorkerProcess();
+  worker.start();
 
-let shutdownPromise: Promise<void> | null = null;
-function requestShutdown(signal: NodeJS.Signals): void {
-  if (shutdownPromise) {
-    return;
+  let shutdownPromise: Promise<void> | null = null;
+  function requestShutdown(signal: NodeJS.Signals): void {
+    if (shutdownPromise) {
+      return;
+    }
+    console.log(`[${worker.id}] received ${signal}`);
+    shutdownPromise = worker
+      .shutdown()
+      .catch((error) => {
+        console.error(`[${worker.id}] shutdown error:`, error);
+      })
+      .finally(() => process.exit(0));
+
+    setTimeout(() => process.exit(1), 30000).unref();
   }
-  console.log(`[${worker.id}] received ${signal}`);
-  shutdownPromise = worker
-    .shutdown()
-    .catch((error) => {
-      console.error(`[${worker.id}] shutdown error:`, error);
-    })
-    .finally(() => process.exit(0));
 
-  setTimeout(() => process.exit(1), 30000).unref();
+  process.on('SIGINT', () => requestShutdown('SIGINT'));
+  process.on('SIGTERM', () => requestShutdown('SIGTERM'));
 }
-
-process.on('SIGINT', () => requestShutdown('SIGINT'));
-process.on('SIGTERM', () => requestShutdown('SIGTERM'));
