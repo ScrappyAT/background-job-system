@@ -56,12 +56,51 @@ async function insertJob(label) {
   return id;
 }
 
+// claimJobs() only selects "WHERE status = 'pending' AND run_at <= now()", so a row
+// scheduled for a future time can never be claimed and therefore can never reach
+// releaseUnstartedClaims() either. That is why that release's unconditional
+// "run_at = now()" cannot destroy a future schedule: it is only ever reached by rows
+// that were already due at claim time.
+//
+// The future timestamp is produced by PostgreSQL from its own clock, so there is no
+// application-vs-database clock-skew question, and it is a full hour out, so this row
+// cannot become claimable by the wall clock advancing during the run.
+async function insertFutureJob(label) {
+  // run_at comes back as text, not a JS Date: now() + interval '1 hour' carries
+  // microseconds and a Date would silently truncate them, which would make the
+  // unchanged-run_at comparison below fail for a reason that has nothing to do with
+  // the behaviour under test. The text form round-trips exactly.
+  const row = (
+    await pool.query(
+      `INSERT INTO jobs (type, payload, status, attempts, max_attempts, run_at, idempotency_key)
+       VALUES ('review_analysis', '{}', 'pending', 0, 5, now() + interval '1 hour', $1)
+       RETURNING id, run_at::text AS run_at`,
+      [`${IDEMPOTENCY_PREFIX}${label}-${Date.now()}-${jobIds.length}`]
+    )
+  ).rows[0];
+  jobIds.push(row.id);
+  return row;
+}
+
 async function readState(id) {
   const row = await pool.query(
     'SELECT status, attempts, started_at, run_at, last_error FROM jobs WHERE id = $1',
     [id]
   );
   return row.rows[0];
+}
+
+// `still_future` and `unchanged` are evaluated by PostgreSQL against its own clock, so
+// neither comparison depends on when this script happens to run.
+async function readFutureState(id, originalRunAt) {
+  const { rows } = await pool.query(
+    `SELECT status, attempts, started_at, finished_at, run_at,
+            (run_at > now()) AS still_future,
+            (run_at = $2::timestamptz) AS unchanged
+     FROM jobs WHERE id = $1`,
+    [id, originalRunAt]
+  );
+  return rows[0];
 }
 
 // Read-only. Never deletes, reschedules, or updates unrelated application jobs.
@@ -83,6 +122,16 @@ async function assertQueueIsolated() {
         `nothing. Re-run it against an idle queue (ideally a dedicated test database).`
     );
   }
+}
+
+// Parks this script's own pending rows far in the future, except `keepId`. Used to make
+// one specific row the only claimable candidate. Never touches unrelated application jobs.
+async function parkOtherPendingRows(keepId) {
+  await pool.query(
+    `UPDATE jobs SET run_at = $1::timestamptz
+     WHERE id = ANY($2::uuid[]) AND id <> $3 AND status = 'pending'`,
+    [PARKED_RUN_AT, jobIds, keepId]
+  );
 }
 
 // Makes `targetId` the single earliest-eligible row so claimJobs(1) can only return it.
@@ -156,6 +205,9 @@ async function main() {
   try {
     const releasedId = await insertJob('released');
     const untouchedId = await insertJob('untouched');
+    // Inserted alongside the two due rows so the very next claim has to skip it, which is
+    // what makes the check below meaningful rather than vacuous.
+    const future = await insertFutureJob('future-run-at');
 
     const claimed = await claimOwn(2);
     const releasedClaim = requireClaim(claimed, releasedId);
@@ -186,6 +238,59 @@ async function main() {
     check(
       'job not passed to the release was left alone (processing, attempts=1)',
       untouchedState.status === 'processing' && untouchedState.attempts === 1
+    );
+
+    console.log('\n-- a future-scheduled run_at is never claimed --');
+
+    // Control: the same claim returned both due rows, so the future run_at is the only
+    // thing separating the skipped row from the two claimed ones.
+    check(
+      'claimJobs skipped the future-scheduled job while claiming both due jobs (control)',
+      claimed.length === 2 &&
+        !claimed.some((job) => job.id === future.id) &&
+        claimed.some((job) => job.id === releasedId) &&
+        claimed.some((job) => job.id === untouchedId)
+    );
+
+    // Decisive. releasedId is pending and due again after the release above, so park
+    // every other pending row this script owns first. The future job is then the only
+    // pending row in the queue, and this claim can return it only if the
+    // "run_at <= now()" predicate is gone. The control check above cannot prove that on
+    // its own: even without the predicate, ordering by run_at ASC would still skip the
+    // future row merely because it is the newest one. prepareSingleTargetClaim() below
+    // restores releasedId to the floor, so the rest of this run is unaffected.
+    await parkOtherPendingRows(future.id);
+    const onlyFuturePending = await claimOwn(1);
+    check(
+      'with the future job the only pending row, claimJobs returned 0 rows',
+      onlyFuturePending.length === 0
+    );
+
+    const futureState = await readFutureState(future.id, future.run_at);
+    check(
+      'the future-scheduled job is still pending and untouched by the claim',
+      futureState.status === 'pending' &&
+        futureState.attempts === 0 &&
+        futureState.started_at === null &&
+        futureState.finished_at === null
+    );
+    check(
+      'its future run_at was not modified and is still in the future',
+      futureState.unchanged === true && futureState.still_future === true
+    );
+
+    // Even a hand-rolled release cannot move it: the guard requires status='processing'.
+    const futureReleaseRows = await releaseUnstartedClaims([
+      { id: future.id, attempt: 0 },
+    ]);
+    check('releasing the never-claimed future job released 0 rows', futureReleaseRows === 0);
+
+    const futureAfterRelease = await readFutureState(future.id, future.run_at);
+    check(
+      'that release left the future schedule and pending status intact',
+      futureAfterRelease.status === 'pending' &&
+        futureAfterRelease.attempts === 0 &&
+        futureAfterRelease.unchanged === true
     );
 
     await prepareSingleTargetClaim(releasedId);
