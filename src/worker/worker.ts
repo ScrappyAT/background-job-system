@@ -8,6 +8,7 @@ import {
   completeJobSucceeded,
   recordJobFailure,
   recoverStuckJobs,
+  releaseUnstartedClaims,
 } from './jobs.worker.repository';
 import { computeRetryDelay } from './retry';
 
@@ -15,13 +16,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-class WorkerProcess {
+/**
+ * The claim function the poll loop uses. It is injectable so a verification can hold a
+ * claim cycle open at a known point; production always uses the real `claimJobs`.
+ */
+export type ClaimJobs = typeof claimJobs;
+
+export class WorkerProcess {
   readonly id = `worker-${process.pid}`;
   private readonly concurrency = config.workerConcurrency;
   private readonly pollIntervalMs = config.workerPollIntervalMs;
   private readonly active = new Set<string>();
   private readonly inFlight = new Set<Promise<void>>();
+  private readonly claimCycles = new Set<Promise<void>>();
   private shuttingDown = false;
+
+  constructor(private readonly claim: ClaimJobs = claimJobs) {}
 
   start(): void {
     console.log(
@@ -42,6 +52,9 @@ class WorkerProcess {
       `[${this.id}] shutdown requested; waiting for ${this.inFlight.size} in-flight job(s)`
     );
     await Promise.allSettled([...this.inFlight]);
+    while (this.claimCycles.size > 0) {
+      await Promise.allSettled([...this.claimCycles]);
+    }
     await closePool();
     console.log(`[${this.id}] database pool closed; shutdown complete`);
   }
@@ -56,19 +69,12 @@ class WorkerProcess {
           console.error(`[${this.id}] stuck-job sweep failed:`, error);
         }
       }
+      if (this.shuttingDown) {
+        break;
+      }
       const freeSlots = this.concurrency - this.active.size;
       if (freeSlots > 0) {
-        try {
-          const jobs = await claimJobs(freeSlots);
-          for (const job of jobs) {
-            if (this.shuttingDown) {
-              break;
-            }
-            this.dispatch(job);
-          }
-        } catch (error) {
-          console.error(`[${this.id}] claim failed:`, error);
-        }
+        await this.claimAndDispatch(freeSlots);
       }
       if (this.shuttingDown) {
         break;
@@ -76,6 +82,52 @@ class WorkerProcess {
       await sleep(this.pollIntervalMs);
     }
     console.log(`[${this.id}] poll loop stopped`);
+  }
+
+  private claimAndDispatch(freeSlots: number): Promise<void> {
+    const cycle = this.runClaimCycle(freeSlots);
+    this.claimCycles.add(cycle);
+    void cycle.finally(() => this.claimCycles.delete(cycle));
+    return cycle;
+  }
+
+  private async runClaimCycle(freeSlots: number): Promise<void> {
+    let claimed: JobRow[] = [];
+    let dispatched = 0;
+    try {
+      claimed = await this.claim(freeSlots);
+      for (const job of claimed) {
+        if (this.shuttingDown) {
+          break;
+        }
+        this.dispatch(job);
+        dispatched += 1;
+      }
+    } catch (error) {
+      console.error(`[${this.id}] claim failed:`, error);
+    }
+    const undispatched = claimed.slice(dispatched);
+    if (undispatched.length > 0) {
+      await this.releaseUndispatched(undispatched);
+    }
+  }
+
+  private async releaseUndispatched(undispatched: JobRow[]): Promise<void> {
+    try {
+      const released = await releaseUnstartedClaims(
+        undispatched.map((job) => ({ id: job.id, attempt: job.attempts }))
+      );
+      console.log(
+        `[${this.id}] released ${released} unstarted claim(s) back to pending during shutdown ` +
+          `ids=${undispatched.map((job) => job.id).join(',')}`
+      );
+    } catch (error) {
+      console.error(
+        `[${this.id}] failed to release ${undispatched.length} unstarted claim(s) ` +
+          `(they fall back to stuck-job recovery):`,
+        error
+      );
+    }
   }
 
   private async sweepStuckJobs(): Promise<void> {
@@ -172,24 +224,30 @@ class WorkerProcess {
   }
 }
 
-const worker = new WorkerProcess();
-worker.start();
+// Bootstrap only. Guarded so that importing this module (for example from a
+// verification) yields the WorkerProcess class without starting a poll loop or
+// registering process-wide signal handlers. `npm run worker` / `npm run worker:start`
+// execute this file directly, so require.main === module holds in production.
+if (require.main === module) {
+  const worker = new WorkerProcess();
+  worker.start();
 
-let shutdownPromise: Promise<void> | null = null;
-function requestShutdown(signal: NodeJS.Signals): void {
-  if (shutdownPromise) {
-    return;
+  let shutdownPromise: Promise<void> | null = null;
+  function requestShutdown(signal: NodeJS.Signals): void {
+    if (shutdownPromise) {
+      return;
+    }
+    console.log(`[${worker.id}] received ${signal}`);
+    shutdownPromise = worker
+      .shutdown()
+      .catch((error) => {
+        console.error(`[${worker.id}] shutdown error:`, error);
+      })
+      .finally(() => process.exit(0));
+
+    setTimeout(() => process.exit(1), 30000).unref();
   }
-  console.log(`[${worker.id}] received ${signal}`);
-  shutdownPromise = worker
-    .shutdown()
-    .catch((error) => {
-      console.error(`[${worker.id}] shutdown error:`, error);
-    })
-    .finally(() => process.exit(0));
 
-  setTimeout(() => process.exit(1), 30000).unref();
+  process.on('SIGINT', () => requestShutdown('SIGINT'));
+  process.on('SIGTERM', () => requestShutdown('SIGTERM'));
 }
-
-process.on('SIGINT', () => requestShutdown('SIGINT'));
-process.on('SIGTERM', () => requestShutdown('SIGTERM'));

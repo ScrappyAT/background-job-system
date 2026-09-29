@@ -20,8 +20,7 @@ export async function claimJobs(limit: number): Promise<JobRow[]> {
     UPDATE jobs j
     SET status = 'processing',
         started_at = now(),
-        attempts = j.attempts + 1,
-        last_error = NULL
+        attempts = j.attempts + 1
     FROM candidates c
     WHERE j.id = c.id
     RETURNING ${JOB_RETURN_COLUMNS}
@@ -29,6 +28,37 @@ export async function claimJobs(limit: number): Promise<JobRow[]> {
     [limit]
   );
   return result.rows;
+}
+
+export interface UnstartedClaim {
+  id: string;
+  attempt: number;
+}
+
+export async function releaseUnstartedClaims(
+  claims: UnstartedClaim[]
+): Promise<number> {
+  if (claims.length === 0) {
+    return 0;
+  }
+  const released = await pool.query(
+    `WITH claimed AS (
+       SELECT * FROM unnest($1::uuid[], $2::int[]) AS c(id, attempt)
+     )
+     UPDATE jobs j
+     SET status = 'pending',
+         attempts = GREATEST(j.attempts - 1, 0),
+         run_at = now(),
+         started_at = NULL,
+         finished_at = NULL
+     FROM claimed c
+     WHERE j.id = c.id
+       AND j.status = 'processing'
+       AND j.attempts = c.attempt
+     RETURNING j.id`,
+    [claims.map((claim) => claim.id), claims.map((claim) => claim.attempt)]
+  );
+  return released.rowCount ?? 0;
 }
 
 export interface RecoveredJob {
