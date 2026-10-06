@@ -1,20 +1,47 @@
 # Background Job System
 
-A background job system for **asynchronous AI customer-review analysis**.
+A reliable background job processing system built with TypeScript, Express and PostgreSQL for running asynchronous workloads outside the HTTP request lifecycle.
 
-A client submits customer-review text to an API. The API records the work as a **job**
-and responds immediately; the AI analysis itself runs later, out of band, in a separate
-worker process.
+The project uses AI customer-review analysis as its workload, but the main engineering focus is the job-processing infrastructure: safely accepting work, processing it concurrently, retrying failures, recovering interrupted jobs and preventing duplicate execution.
 
-> **Phase 7 status:** `review_analysis` jobs now perform a **real DeepSeek API call**
-> (OpenAI-compatible) instead of a deterministic simulation. The response is parsed and
-> validated locally with Zod (incl. a verbatim-quote check) before being persisted as the
-> job's durable result. Provider failures (and validation rejections) are treated like any
-> other handler failure, so they flow through the existing retry/backoff/dead-letter
-> lifecycle. Requires `DEEPSEEK_API_KEY` for real work; `testFailureMode` break-tests still
-> fail **before** the provider call. Authentication is **not** implemented yet. See
-> [Review-analysis handler (real DeepSeek API)](#review-analysis-handler-real-deepseek-api)
-> and [What is intentionally NOT implemented yet](#what-is-intentionally-not-implemented-yet).
+## Key Engineering Features
+
+- Asynchronous job processing with a separate worker process
+- PostgreSQL-backed persistent job queue
+- Idempotent job creation using database constraints
+- Concurrent job processing with configurable limits
+- Safe coordination between multiple workers
+- Retry handling with exponential backoff
+- Maximum-attempt enforcement
+- Dead-letter handling for exhausted jobs
+- Stuck-job detection and recovery
+- Manual retry of dead jobs
+- Graceful worker shutdown and job release
+- Durable job results
+- Real DeepSeek integration for AI review analysis
+- Zod validation of AI-generated structured output
+- Verification scripts for failure and recovery scenarios
+
+## How It Works
+
+```text
+Client
+   ↓
+Express API
+   ↓
+Create Job in PostgreSQL
+   ↓
+Return 202 Accepted
+   ↓
+Background Worker
+   ↓
+Claim Job
+   ↓
+Process Work
+   ↓
+Success → Store Result
+   │
+   └── Failure → Backoff → Retry → Dead Letter
 
 ## Tech stack
 
